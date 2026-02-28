@@ -8,6 +8,8 @@ import contextlib
 import re
 from html import escape
 from typing import Optional
+import random
+import sqlite3
 
 from telegram import (
     Update,
@@ -42,15 +44,27 @@ DB_USER = os.getenv("SUPABASE_USER")
 DB_PASS = os.getenv("SUPABASE_PASSWORD")
 DB_PORT = int(os.getenv("SUPABASE_PORT", "6543"))
 
-# Link + mute
-LINK_LIMIT = 3
-MUTE_SECONDS = 600
-SPAM_RESET_SECONDS = 3600
-
-# Admin-list cache (performance: avoid per-user get_chat_member on every link)
+# Admin-list cache (performance: avoid per-user get_chat_member too often)
 ADMIN_LIST_CACHE: dict[int, set[int]] = {}
 ADMIN_LIST_CACHE_TS: dict[int, int] = {}
 ADMIN_LIST_TTL = 60  # seconds (1 min)
+
+# ===============================
+# TAG MENTION BOT (LOCKED RULES)
+# ===============================
+FALLBACK_DB_PATH = os.getenv("FALLBACK_DB_PATH", "/data/tagbot_cache.db")
+MENTION_COOLDOWN_SECONDS = 30
+ACTIVE_SECONDS = 300  # /call = last 5 minutes active
+EMOJIS_PER_MESSAGE = 7
+
+# as big as you want (add more anytime)
+EMOJI_POOL = [
+  "🤣","😁","😊","😥","😎","❤️","👈","☠️","👽","👾","🤖","🎃","💀","👻",
+  "😚","🤨","😹","👍","🥰","💞","🔥","✨","🌟","💥","🎉","🎊","💯","✅","⚡",
+  "🌈","🍀","🍎","🍉","🍓","🍒","🍑","🍍","🥭","🍇","🍌","🥥","🍪","🍩",
+  "🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐸","🦁","🐯","🐵","🐧","🦄",
+  "🎯","🎮","🎵","🎧","📌","📣","📢","🚀","🧨","🛡️","🧠","🫶","🙏","🤝"
+]
 
 # ===============================
 # GLOBAL CACHES / STATE
@@ -66,14 +80,15 @@ PENDING_TARGET = {}
 PENDING_BUTTON_WAIT = {}
 BOT_START_TIME = int(time.time())
 
-LINK_SPAM_CACHE = {}
-LINK_SPAM_CACHE_TTL = 7200  # 2 hours
-
 LOG_RATE_CACHE = {}
 LOG_RATE_SECONDS = 60
 
 ADMIN_VERIFY_CACHE = {}
 ADMIN_VERIFY_SECONDS = 60
+
+# Tag mention runtime caches (DB down ok)
+LAST_MENTION_TS: dict[int, int] = {}   # chat_id -> ts
+STOPPED_CHATS: set[int] = set()        # chat_id stopped by /stop
 
 # ===============================
 # DB POOL + DB EXEC
@@ -113,6 +128,53 @@ async def safe_db_execute(query, params=None, fetch=False):
         return None
 
 # ===============================
+# FALLBACK SQLITE (PERSIST MEMBERS + STOP STATE)
+# ===============================
+_sql_conn = None
+_sqlite_lock = asyncio.Lock()
+
+def _sqlite_connect():
+    global _sql_conn
+    if _sql_conn is None:
+        # check_same_thread=False because we run in executor threads
+        _sql_conn = sqlite3.connect(FALLBACK_DB_PATH, check_same_thread=False)
+    return _sql_conn
+
+async def sqlite_execute(query: str, params=(), fetch: bool=False):
+    loop = asyncio.get_running_loop()
+    async with _sqlite_lock:
+        def _run():
+            conn = _sqlite_connect()
+            cur = conn.cursor()
+            cur.execute(query, params)
+            if fetch:
+                rows = cur.fetchall()
+                conn.commit()
+                return rows
+            conn.commit()
+            return None
+        return await loop.run_in_executor(None, _run)
+
+async def init_fallback_sqlite():
+    # Always available even when Postgres down
+    await sqlite_execute("""
+      CREATE TABLE IF NOT EXISTS members (
+        chat_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        last_seen INTEGER NOT NULL,
+        PRIMARY KEY (chat_id, user_id)
+      )
+    """)
+    await sqlite_execute("""
+      CREATE TABLE IF NOT EXISTS stops (
+        chat_id INTEGER PRIMARY KEY,
+        stopped_by INTEGER,
+        stopped_by_name TEXT,
+        stopped_at INTEGER
+      )
+    """)
+
+# ===============================
 # DB INIT / DB HELPERS
 # ===============================
 async def init_db():
@@ -136,27 +198,6 @@ async def init_db():
     # safety for existing DB (if table already created)
     await safe_db_execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS fail_count INT DEFAULT 0")
     await safe_db_execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS last_fail_at BIGINT")   
-    
-    await safe_db_execute("""
-        CREATE TABLE IF NOT EXISTS link_spam (
-            chat_id BIGINT,
-            user_id BIGINT,
-            count INT,
-            last_time BIGINT,
-            PRIMARY KEY (chat_id, user_id)
-        )
-    """)
-
-async def upsert_link_spam(chat_id: int, user_id: int, count: int, last_time: int):
-    await safe_db_execute(
-        """
-        INSERT INTO link_spam (chat_id, user_id, count, last_time)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (chat_id, user_id)
-        DO UPDATE SET count = EXCLUDED.count, last_time = EXCLUDED.last_time
-        """,
-        (chat_id, user_id, count, last_time)
-    )
 
 async def is_group_admin_cached_db(chat_id: int) -> bool:
     rows = await safe_db_execute(
@@ -187,16 +228,6 @@ def clear_reminders(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         name = job.name or ""
         if name.startswith("auto_leave_") or data.get("type") == "admin_reminder":
             job.schedule_removal()
-
-async def cleanup_link_spam_cache(context: ContextTypes.DEFAULT_TYPE):
-    now = int(time.time())
-    removed = 0
-    for key, data in list(LINK_SPAM_CACHE.items()):
-        if now - data["last_time"] > LINK_SPAM_CACHE_TTL:
-            LINK_SPAM_CACHE.pop(key, None)
-            removed += 1
-    if removed:
-        print(f"🧹 RAM cache cleaned: {removed} entries")
 
 # pagination helper (OFFSET version) - from your pasted code
 async def iter_db_ids(query, batch_size=500):
@@ -233,7 +264,7 @@ async def update_progress(msg, done, total):
 async def get_admin_set(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     """
     Fast path: fetch admin list once per TTL and reuse.
-    This avoids calling get_chat_member(chat_id, user_id) for every link message.
+    This avoids calling get_chat_member(chat_id, user_id) too often.
     """
     now = int(time.time())
     ts = ADMIN_LIST_CACHE_TS.get(chat_id, 0)
@@ -249,6 +280,95 @@ async def get_admin_set(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         return ADMIN_LIST_CACHE.get(chat_id, set()), False
 
 # ===============================
+# TAG MENTION HELPERS
+# ===============================
+async def is_group_admin_or_creator(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    try:
+        m = await context.bot.get_chat_member(chat_id, user_id)
+        return m.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+async def can_bot_work_for_mentions(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Locked rule: Bot must be admin to work.
+    (We DON'T require delete permission for tag-mention; only admin/creator.)
+    """
+    try:
+        me = await context.bot.get_chat_member(chat_id, context.bot.id)
+        return me.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+async def upsert_member_activity(chat_id: int, user_id: int):
+    now = int(time.time())
+    # Always persist to SQLite (survive DB down + restart)
+    await sqlite_execute(
+        "INSERT INTO members(chat_id,user_id,last_seen) VALUES(?,?,?) "
+        "ON CONFLICT(chat_id,user_id) DO UPDATE SET last_seen=excluded.last_seen",
+        (chat_id, user_id, now)
+    )
+    # Optional: also persist to Postgres if available (not required for fallback)
+    if DB_READY:
+        await safe_db_execute(
+          """
+          CREATE TABLE IF NOT EXISTS members (
+            chat_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            last_seen BIGINT NOT NULL,
+            PRIMARY KEY(chat_id, user_id)
+          )
+          """
+        )
+        await safe_db_execute(
+          "INSERT INTO members(chat_id,user_id,last_seen) VALUES(%s,%s,%s) "
+          "ON CONFLICT(chat_id,user_id) DO UPDATE SET last_seen=EXCLUDED.last_seen",
+          (chat_id, user_id, now)
+        )
+
+def build_emoji_mentions(user_ids: list[int]) -> str:
+    # 7 per message, emoji text hides mention target
+    mentions = []
+    # randomize emoji each run
+    pool = EMOJI_POOL[:]
+    random.shuffle(pool)
+    for i, uid in enumerate(user_ids):
+        emoji = pool[i % len(pool)]
+        mentions.append(f"<a href='tg://user?id={uid}'>{emoji}</a>")
+    return "".join(mentions)
+
+async def get_all_members(chat_id: int) -> list[int]:
+    # Prefer Postgres if available; fallback SQLite always works
+    if DB_READY:
+        rows = await safe_db_execute(
+          "SELECT user_id FROM members WHERE chat_id=%s ORDER BY last_seen DESC",
+          (chat_id,), fetch=True
+        )
+        if rows:
+            return [int(r["user_id"]) for r in rows]
+    rows2 = await sqlite_execute(
+      "SELECT user_id FROM members WHERE chat_id=? ORDER BY last_seen DESC",
+      (chat_id,), fetch=True
+    ) or []
+    return [int(r[0]) for r in rows2]
+
+async def get_active_members(chat_id: int) -> list[int]:
+    now = int(time.time())
+    cutoff = now - ACTIVE_SECONDS
+    if DB_READY:
+        rows = await safe_db_execute(
+          "SELECT user_id FROM members WHERE chat_id=%s AND last_seen >= %s ORDER BY last_seen DESC",
+          (chat_id, cutoff), fetch=True
+        )
+        if rows:
+            return [int(r["user_id"]) for r in rows]
+    rows2 = await sqlite_execute(
+      "SELECT user_id FROM members WHERE chat_id=? AND last_seen>=? ORDER BY last_seen DESC",
+      (chat_id, cutoff), fetch=True
+    ) or []
+    return [int(r[0]) for r in rows2]
+
+# ===============================
 # ADMIN / PERMISSION HELPERS
 # ===============================
 async def is_bot_admin(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -262,6 +382,9 @@ async def is_bot_admin(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool
         return False
     except:
         return False
+
+# (NOTE) is_bot_admin/ensure_bot_admin_live ကို existing broadcast/admin-cache သုံးနေတုန်းပါ
+# Tag mention commands အတွက်တော့ can_bot_work_for_mentions() ကိုသီးသန့်သုံးမယ်
 
 async def ensure_bot_admin_live(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     now = int(time.time())
@@ -292,12 +415,6 @@ async def ensure_bot_admin_live(chat_id: int, context: ContextTypes.DEFAULT_TYPE
             ADMIN_LIST_CACHE[new_id] = ADMIN_LIST_CACHE.pop(chat_id)
         if chat_id in ADMIN_LIST_CACHE_TS:
             ADMIN_LIST_CACHE_TS[new_id] = ADMIN_LIST_CACHE_TS.pop(chat_id)
-        
-        # migrate LINK_SPAM_CACHE keys (chat_id, user_id)
-        for (cid, uid), v in list(LINK_SPAM_CACHE.items()):
-            if cid == chat_id:
-                LINK_SPAM_CACHE[(new_id, uid)] = v
-                LINK_SPAM_CACHE.pop((cid, uid), None)
 
         # -------- DB migrate --------
         # ✅ IMPORTANT: UPSERT new row + remove old row (avoid stale rows)
@@ -317,12 +434,6 @@ async def ensure_bot_admin_live(chat_id: int, context: ContextTypes.DEFAULT_TYPE
         
         context.application.create_task(
             safe_db_execute("DELETE FROM groups WHERE group_id=%s", (chat_id,))
-        )
-        context.application.create_task(
-            safe_db_execute(
-                "DELETE FROM link_spam WHERE chat_id=%s",
-                (chat_id,)
-            )
         )
         
         # retry with new chat_id
@@ -420,12 +531,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"<b>────「 {bot_mention} 」────</b>\n\n"
             f"<b>ဟယ်လို {user_mention} ! 👋</b>\n\n"
-            "<b>ငါသည် Group များအတွက် Link ဖျက် Bot တစ်ခုဖြစ်တယ်။</b>\n"
+            "<b>ငါသည် Group များအတွက် Tag Mention Bot တစ်ခုဖြစ်တယ်။</b>\n"
             "<b>ငါ၏လုပ်နိုင်စွမ်းကို ကောင်းကောင်းအသုံးချပါ။</b>\n\n"
             "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
             "<b>📌 ငါ၏လုပ်နိုင်စွမ်း</b>\n\n"
-            "✅ Auto Link Delete ( Setting ချိန်းစရာမလိုပဲ ချက်ချင်း အလုပ်လုပ်။ )\n"
-            "✅ Spam Link Mute ( Link 3 ခါ ပို့ရင် 10 မိနစ် Auto Mute ပေး။ )\n\n"
+            "✅ Tag Mention (LawSpeaker) / Group mention helper\n\n"
             "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
             "<b>📥 ငါ့ကိုအသုံးပြုရန်</b>\n\n"
             "➕ ငါ့ကို Group ထဲထည့်ပါ\n"
@@ -470,8 +580,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await bot.send_message(
                     chat.id,
                     "✅ Bot ကို Admin အဖြစ်ခန့်ထားပြီးသားပါ။\n\n"
-                    "🔗 <b>Auto Link Delete</b>\n"
-                    "🔇 <b>Spam Link Mute</b>\n\n"
+                    "🏷️ <b>LawSpeaker Tag Mention</b>\n\n"
                     "🤖 Bot က လက်ရှိ Group မှာ ကောင်းကောင်းအလုပ်လုပ်နေပါပြီး။",
                     parse_mode="HTML"
                 )
@@ -487,7 +596,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⚠️ <b>Bot သည် Admin မဟုတ်သေးပါ</b>\n\n"
                 "🤖 <b>Bot ကို အလုပ်လုပ်စေရန်</b>\n"
                 "⭐️ <b>Admin Permission ပေးပါ</b>\n\n"
-                "Required: Delete messages",
+                "Required: Admin Permission",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(
@@ -541,12 +650,11 @@ async def donate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         start_text = (
             f"<b>────「 {bot_mention} 」────</b>\n\n"
             f"<b>ဟယ်လို {user_mention} ! 👋</b>\n\n"
-            "<b>ငါသည် Group များအတွက် Link ဖျက် Bot တစ်ခုဖြစ်တယ်။</b>\n"
+            "<b>ငါသည် Group များအတွက် Tag Mention Bot တစ်ခုဖြစ်တယ်။</b>\n"
             "<b>ငါ၏လုပ်နိုင်စွမ်းကို ကောင်းကောင်းအသုံးချပါ။</b>\n\n"
             "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
             "<b>📌 ငါ၏လုပ်နိုင်စွမ်း</b>\n\n"
-            "✅ Auto Link Delete ( Setting ချိန်းစရာမလိုပဲ ချက်ချင်း အလုပ်လုပ်။ )\n"
-            "✅ Spam Link Mute ( Link 3 ခါ ပို့ရင် 10 မိနစ် Auto Mute ပေး။ )\n\n"
+            "✅ Tag Mention (LawSpeaker) / Group mention helper\n\n"
             "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
             "<b>📥 ငါ့ကိုအသုံးပြုရန်</b>\n\n"
             "➕ ငါ့ကို Group ထဲထည့်ပါ\n"
@@ -664,175 +772,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏱️ Uptime: <b>{h}h {m}m</b>",
         parse_mode="HTML"
     )
-
-# ===============================
-# AUTO LINK DELETE
-# ===============================
-async def auto_delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    msg = update.effective_message
-    user = update.effective_user
-    if not chat or not msg or not user:
-        return
-    if chat.type not in ("group", "supergroup"):
-        return
-    if user.id == OWNER_ID:
-        return
-
-    chat_id = chat.id
-    user_id = user.id
-
-    # link_filters already ensured "likely contains link"
-    # Keep a tiny extra safety check only for plain text patterns
-    text = (msg.text or msg.caption or "").lower()
-    if not ("http://" in text or "https://" in text or "t.me/" in text):
-        # if Telegram entity-based link, handler is already filtered in main()
-        # so we can still proceed; no return needed
-        pass
-
-    # ✅ BOT ADMIN CHECK (SOURCE OF TRUTH = Telegram API)
-    # (No DB-cache gate here; DB is support-only)
-    if not await ensure_bot_admin_live(chat_id, context):
-        return
-
-    # ✅ FAST ADMIN SKIP (no per-user get_chat_member spam)
-    admin_set, ok = await get_admin_set(chat_id, context)
-    if user_id in admin_set:
-        return
-    # ✅ SAFETY: if admin list couldn't be refreshed (API fail),
-    # confirm this user only (prevents deleting admins/creator by mistake)
-    if not ok:
-        try:
-            if await is_user_admin(chat_id, user_id, context):
-                return
-        except Exception:
-            return
-
-    # delete (handle rate limit better)
-    try:
-        await msg.delete()
-    except RetryAfter as e:
-        # Telegram rate limit: wait then retry once
-        try:
-            await asyncio.sleep(e.retry_after)
-            await msg.delete()
-        except Exception as e2:
-            rate_limited_log(f"delete_fail_{chat_id}", f"❌ Delete retry failed in {chat_id}: {e2}")
-            return    
-    except BadRequest as e:
-        rate_limited_log(f"delete_skip_{chat_id}", f"ℹ️ Delete skipped in {chat_id}: {e}")
-        return
-    except Exception as e:
-        rate_limited_log(f"delete_fail_{chat_id}", f"❌ Delete failed in {chat_id}: {e}")
-        return
-
-    muted = await link_spam_control(chat_id, chat.type, user_id, context)
-    name = escape(user.first_name or "User")
-    user_mention = f'<a href="tg://user?id={user.id}">{name}</a>'
-
-    if not muted:
-        try:
-            await context.bot.send_message(
-                chat_id,
-                f"⚠️ <b>{user_mention}</b> မင်းရဲ့စာကို ဖျက်လိုက်ပါပြီး။\n"
-                "အကြောင်းပြချက်: 🔗 Link ပို့လို့ မရပါဘူး။",
-                parse_mode="HTML"
-            )
-        except RetryAfter:
-            pass
-        except:
-            pass
-    else:
-        try:
-            await context.bot.send_message(
-                chat_id,
-                f"🔇 <b>{user_mention}</b>\n"
-                f"🔗 Link {LINK_LIMIT} ကြိမ် ပို့လို့\n"
-                f"⏰ 10 မိနစ် mute လုပ်လိုက်ပါပြီး",
-                parse_mode="HTML"
-            )
-        except:
-            pass
-
-async def link_spam_control(chat_id: int, chat_type: str, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    now = int(time.time())
-    key = (chat_id, user_id)
-
-    data = LINK_SPAM_CACHE.get(key)
-    if data:
-        mute_until = data.get("mute_until", 0)
-        if mute_until and now < mute_until:
-            return True
-        # ✅ ALWAYS count every new link attempt
-        last_time = int(data.get("last_time", 0))
-        if now - last_time > SPAM_RESET_SECONDS:
-            data["count"] = 1
-        else:
-            data["count"] = int(data.get("count", 0)) + 1
-        data["last_time"] = now
-    else:
-        try:
-            rows = await asyncio.wait_for(
-                safe_db_execute(
-                    """
-                    SELECT count, last_time
-                    FROM link_spam
-                    WHERE chat_id=%s AND user_id=%s
-                    """,
-                    (chat_id, user_id),
-                    fetch=True
-                ),
-                timeout=2
-            )
-        except:
-            rows = None
-
-        if rows:
-            last_time = rows[0]["last_time"]
-            # ✅ ALWAYS count every new link attempt (no early return)
-            count = 1 if now - last_time > SPAM_RESET_SECONDS else int(rows[0]["count"]) + 1
-        else:
-            count = 1
-
-        data = {"count": count, "last_time": now}
-        LINK_SPAM_CACHE[key] = data
-
-    if data["count"] < LINK_LIMIT:
-        context.application.create_task(
-            upsert_link_spam(chat_id, user_id, data["count"], data["last_time"])
-        )
-        return False
-
-    if chat_type != "supergroup":
-        return False
-
-    try:
-        me = await context.bot.get_chat_member(chat_id, context.bot.id)
-        if not getattr(me, "can_restrict_members", False):
-            return False
-    except:
-        return False
-
-    try:
-        await context.bot.restrict_chat_member(
-            chat_id,
-            user_id,
-            ChatPermissions(can_send_messages=False),
-            until_date=now + MUTE_SECONDS
-        )
-    except:
-        return False
-
-    LINK_SPAM_CACHE[key] = {
-        "count": data.get("count", LINK_LIMIT),
-        "last_time": now,
-        "mute_until": now + MUTE_SECONDS
-    }
-
-    context.application.create_task(
-        safe_db_execute("DELETE FROM link_spam WHERE chat_id=%s AND user_id=%s", (chat_id, user_id))
-    )
-    return True
 
 # ===============================
 # BROADCAST FAIL TRACKING (NON-ADMIN CLEANUP)
@@ -1191,12 +1130,6 @@ async def safe_send(func, *args, **kwargs):
                 if old_chat_id in ADMIN_LIST_CACHE_TS:
                     ADMIN_LIST_CACHE_TS[new_chat_id] = ADMIN_LIST_CACHE_TS.pop(old_chat_id)
 
-                # link spam cache keys (chat_id, user_id)
-                for (cid, uid), v in list(LINK_SPAM_CACHE.items()):
-                    if cid == old_chat_id:
-                        LINK_SPAM_CACHE[(new_chat_id, uid)] = v
-                        LINK_SPAM_CACHE.pop((cid, uid), None)
-
                 try:
                     me = await ctx.bot.get_chat_member(new_chat_id, ctx.bot.id)   
                     is_admin = me.status in ("administrator", "creator") and getattr(me, "can_delete_messages", False)
@@ -1219,10 +1152,7 @@ async def safe_send(func, *args, **kwargs):
                 ctx.application.create_task(
                     safe_db_execute("DELETE FROM groups WHERE group_id=%s", (old_chat_id,))
                 )
-                # ✅ IMPORTANT: clear old link_spam rows to avoid DB leftovers
-                ctx.application.create_task(
-                    safe_db_execute("DELETE FROM link_spam WHERE chat_id=%s", (old_chat_id,))
-                )
+
                 new_args = (args[0], new_chat_id, *args[2:])
                 args = new_args
                 continue
@@ -1451,9 +1381,6 @@ async def leave_if_not_admin(context: ContextTypes.DEFAULT_TYPE):
             (int(time.time()), chat_id)
         )
     )
-    context.application.create_task(
-        safe_db_execute("DELETE FROM link_spam WHERE chat_id=%s", (chat_id,))
-    )
     return
 
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1511,7 +1438,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat.id,
                 "✅ <b>Thank you!</b>\n\n"
                 "🤖 Bot ကို <b>Admin</b> အဖြစ် ခန့်ထားပြီးပါပြီး။\n"
-                "🔗 Auto Link Delete & Spam Link Mute စနစ် စတင်အလုပ်လုပ်နေပါပြီး.........!",
+                "🏷️ LawSpeaker Tag Mention စနစ် စတင်အလုပ်လုပ်နေပါပြီး.........!",
                 parse_mode="HTML"
             )
         except:
@@ -1606,7 +1533,7 @@ async def admin_reminder(context: ContextTypes.DEFAULT_TYPE):
             f"⏰ <b>Reminder ({count}/{total})</b>\n\n"
             "🤖 Bot ကို အလုပ်လုပ်နိုင်ရန်\n"
             "⭐️ <b>Admin Permission ပေးပါ</b>\n\n"
-            "⚠️ Required: Delete messages",
+            "⚠️ Required: Admin Permission",
             parse_mode="HTML",
             reply_markup=keyboard
         )
@@ -1658,9 +1585,9 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await msg.reply_text(
-                "⚠️ <b>Bot မှာ Delete permission မရှိပါ</b>\n\n"
+                "⚠️ <b>Bot မှာ Admin permission မရှိပါ</b>\n\n"
                 "🔧 Admin setting ထဲမှာ\n"
-                "✅ <b>Delete Messages</b> ကို ဖွင့်ပေးပါ",
+                "✅ <b>Admin Permission</b> ပေးပါ",
                 parse_mode="HTML"
             )
             return
@@ -1734,8 +1661,6 @@ async def refresh_admin_cache(app):
                 (new_id, now)
             )
             await safe_db_execute("DELETE FROM groups WHERE group_id=%s", (gid,))
-            # ✅ IMPORTANT: clear old link_spam rows to avoid DB leftovers
-            await safe_db_execute("DELETE FROM link_spam WHERE chat_id=%s", (gid,))
             # ✅ RAM migrate
             if gid in BOT_ADMIN_CACHE:
                 BOT_ADMIN_CACHE.discard(gid)
@@ -1748,10 +1673,6 @@ async def refresh_admin_cache(app):
             if gid in ADMIN_LIST_CACHE_TS:
                 ADMIN_LIST_CACHE_TS[new_id] = ADMIN_LIST_CACHE_TS.pop(gid)
                         
-            for (cid, uid), v in list(LINK_SPAM_CACHE.items()):
-                if cid == gid:
-                    LINK_SPAM_CACHE[(new_id, uid)] = v
-                    LINK_SPAM_CACHE.pop((cid, uid), None)
             # ✅ retry admin check using new_id (same loop iteration)
             try:
                 me2 = await app.bot.get_chat_member(new_id, app.bot.id)
@@ -1825,6 +1746,155 @@ async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ===============================
+# TAG MENTION COMMANDS
+# ===============================
+async def stop_mentions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+    if not chat or not user or not msg:
+        return
+    if chat.type not in ("group", "supergroup"):
+        return
+    if not await is_group_admin_or_creator(chat.id, user.id, context):
+        await msg.reply_text("⚠️ မင်းမှာ ဒီ Command သုံးရန် permission မရှိပါ။")
+        return
+    if not await can_bot_work_for_mentions(chat.id, context):
+        await msg.reply_text(
+          "⚠️ <b>Admin Permission Required</b>\n\nBot ကို Admin ပေးမှ /stop သုံးလို့ရမယ်။",
+          parse_mode="HTML"
+        )
+        return
+    
+    STOPPED_CHATS.add(chat.id)
+    await sqlite_execute(
+      "INSERT INTO stops(chat_id,stopped_by,stopped_by_name,stopped_at) VALUES(?,?,?,?) "
+      "ON CONFLICT(chat_id) DO UPDATE SET stopped_by=excluded.stopped_by, stopped_by_name=excluded.stopped_by_name, stopped_at=excluded.stopped_at",
+      (chat.id, user.id, user.full_name or "", int(time.time()))
+    )
+    who = escape(user.full_name or "Admin")
+    await msg.reply_text(f"⛔ Mention ကို <b>{who}</b> က ရပ်လိုက်ပါတယ်။", parse_mode="HTML")
+
+async def _mention_common_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[bool, str]:
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+    if not chat or not user or not msg:
+        return False, ""
+    if chat.type not in ("group", "supergroup"):
+        return False, ""
+    # admin-only
+    if not await is_group_admin_or_creator(chat.id, user.id, context):
+        await msg.reply_text("⚠️ မင်းမှာ ဒီ Command သုံးရန် permission မရှိပါ။")
+        return False, ""
+    # bot must be admin
+    if not await can_bot_work_for_mentions(chat.id, context):
+        await msg.reply_text(
+          "⚠️ <b>Admin Permission Required</b>\n\n"
+          "Bot ကို Admin ပေးမှ Tag Mention အလုပ်လုပ်ပါမယ်။",
+          parse_mode="HTML"
+        )
+        return False, ""
+    # cooldown 30s
+    now = int(time.time())
+    last = LAST_MENTION_TS.get(chat.id, 0)
+    if now - last < MENTION_COOLDOWN_SECONDS:
+        wait = MENTION_COOLDOWN_SECONDS - (now - last)
+        await msg.reply_text(f"⏳ Cooldown... ({wait}s) နောက်မှထပ်သုံးပါ။")
+        return False, ""
+    LAST_MENTION_TS[chat.id] = now
+    # if stopped, auto-resume by using /all /admins /call (no resume message)
+    if chat.id in STOPPED_CHATS:
+        STOPPED_CHATS.discard(chat.id)
+        await sqlite_execute("DELETE FROM stops WHERE chat_id=?", (chat.id,))
+    return True, (msg.text or "").strip()
+
+async def mention_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok, raw = await _mention_common_guard(update, context)
+    if not ok:
+        return
+    chat = update.effective_chat
+    msg = update.effective_message
+    text = raw.replace("/admins", "", 1).strip()
+    admins = await context.bot.get_chat_administrators(chat.id)
+    ids = []
+    for a in admins:
+        u = getattr(a, "user", None)
+        if not u or u.is_bot:
+            continue
+        ids.append(int(u.id))
+    ids = list(dict.fromkeys(ids))
+    await _send_mentions_in_chunks(msg, ids, text)
+
+async def mention_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok, raw = await _mention_common_guard(update, context)
+    if not ok:
+        return
+    chat = update.effective_chat
+    msg = update.effective_message
+    text = raw.replace("/all", "", 1).strip()
+    ids = await get_all_members(chat.id)
+    # remove bot id if present
+    ids = [i for i in ids if i != context.bot.id]
+    await _send_mentions_in_chunks(msg, ids, text)
+
+async def mention_everyone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # alias of /all
+    ok, raw = await _mention_common_guard(update, context)
+    if not ok:
+        return
+    chat = update.effective_chat
+    msg = update.effective_message
+    text = raw.replace("/everyone", "", 1).strip()
+    ids = await get_all_members(chat.id)
+    ids = [i for i in ids if i != context.bot.id]
+    await _send_mentions_in_chunks(msg, ids, text)
+
+async def mention_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok, raw = await _mention_common_guard(update, context)
+    if not ok:
+        return
+    chat = update.effective_chat
+    msg = update.effective_message
+    text = raw.replace("/call", "", 1).strip()
+    ids = await get_active_members(chat.id)
+    ids = [i for i in ids if i != context.bot.id]
+    await _send_mentions_in_chunks(msg, ids, text)
+
+async def _send_mentions_in_chunks(msg, user_ids: list[int], text: str):
+    # empty list guard
+    if not user_ids:
+        await msg.reply_text("⚠️ Member list မရှိသေးပါ။ (အနည်းငယ် message တွေပြောပြီးမှ /all လုပ်ပါ)")
+        return
+    # chunk 7 each message
+    for i in range(0, len(user_ids), EMOJIS_PER_MESSAGE):
+        chunk = user_ids[i:i+EMOJIS_PER_MESSAGE]
+        line = build_emoji_mentions(chunk)
+        if text:
+            body = f"{escape(text)}\n{line}"
+        else:
+            body = f"{line}"
+        try:
+            await msg.reply_text(body, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception:
+            # fallback plain text (mentions might not work)
+            await msg.reply_text((text + "\n" if text else "") + " ".join(["🙂"]*len(chunk)))
+        await asyncio.sleep(0.7)  # reduce flood
+
+async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+    if not chat or not user or not msg:
+        return
+    if chat.type not in ("group", "supergroup"):
+        return
+    if user.is_bot:
+        return
+    # record only real messages
+    await upsert_member_activity(chat.id, user.id)
+
+# ===============================
 # MAIN
 # ===============================
 def main():
@@ -1840,6 +1910,16 @@ def main():
     app.add_handler(CommandHandler("refresh", refresh))
     app.add_handler(CommandHandler("refresh_all", refresh_all))
 
+    # Tag Mention Commands (LOCKED)
+    app.add_handler(CommandHandler("admins", mention_admins))
+    app.add_handler(CommandHandler("all", mention_all))
+    app.add_handler(CommandHandler("everyone", mention_everyone))
+    app.add_handler(CommandHandler("call", mention_active))
+    app.add_handler(CommandHandler("stop", stop_mentions))
+
+    # Track member activity (build list over time)
+    app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, track_activity), group=1)
+    
     # Donate / Payments
     app.add_handler(CallbackQueryHandler(donate_callback, pattern=r"^donate"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
@@ -1847,19 +1927,6 @@ def main():
 
     # Chat member
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-
-    # Auto link delete (OPTIMIZED: only run handler when message likely contains links)
-    link_filters = (
-        filters.Entity("url")
-        | filters.Entity("text_link")
-        | filters.CaptionEntity("url")
-        | filters.CaptionEntity("text_link")
-        | filters.Regex(r"(https?://|t\.me/)")
-    )
-    app.add_handler(
-        MessageHandler((filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP) & link_filters, auto_delete_links),
-        group=0
-    )
 
     # Broadcast
     app.add_handler(
@@ -1885,6 +1952,17 @@ def main():
 
         await app.bot.delete_webhook(drop_pending_updates=True)
 
+        # ✅ Fallback sqlite always init first (survive DB down + restart)
+        try:
+            await init_fallback_sqlite()
+            print(f"✅ Fallback SQLite ready: {FALLBACK_DB_PATH}", flush=True)
+            # load stopped chats from sqlite (persist /stop across restart)
+            rows = await sqlite_execute("SELECT chat_id FROM stops", fetch=True) or []
+            STOPPED_CHATS.clear()
+            STOPPED_CHATS.update(int(r[0]) for r in rows)
+        except Exception as e:
+            print("⚠️ Fallback SQLite init failed:", e, flush=True)
+        
         try:
             pool = ConnectionPool(
                 conninfo=(
@@ -1914,17 +1992,8 @@ def main():
             print("✅ DB init done", flush=True)
             now = await refresh_admin_cache(app)
             print("✅ Admin cache refreshed", flush=True)
-        
-        # 🔄 schedule RAM cache cleanup (every 30 minutes) ✅ CORRECT PLACE
-        if app.job_queue:
-            app.job_queue.run_repeating(
-                cleanup_link_spam_cache,
-                interval=1800,   # 30 minutes
-                first=1800
-            )
-            print("🧹 RAM cache cleanup job scheduled", flush=True)
 
-        print("🤖 Link Delete Bot running (PRODUCTION READY)", flush=True)
+        print("🤖 LawSpeaker Tag Bot running (PRODUCTION READY)", flush=True)
     
     async def on_error(update, context):
         if isinstance(context.error, RetryAfter):
