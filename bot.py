@@ -36,7 +36,7 @@ from psycopg_pool import ConnectionPool  # ✅ ONLY THIS (Supabase safe)
 # ===============================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-START_IMAGE = "https://i.postimg.cc/T3r3nqDr/photo_2026_02_10_01_15_34.jpg"
+START_IMAGE = "https://i.postimg.cc/Z50C1r4y/Untitled-design-(23).png"
 
 DB_HOST = os.getenv("SUPABASE_HOST")
 DB_NAME = os.getenv("SUPABASE_DB")
@@ -529,10 +529,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         text = (
-            f"<b>────「 {bot_mention} 」────</b>\n\n"
+            f"<b>────「 {bot_mention} 」</b>\n\n"
             f"<b>ဟယ်လို {user_mention} ! 👋</b>\n\n"
-            "<b>ငါသည် Group များအတွက် Tag Mention Bot တစ်ခုဖြစ်တယ်။</b>\n"
-            "<b>ငါ၏လုပ်နိုင်စွမ်းကို ကောင်းကောင်းအသုံးချပါ။</b>\n\n"
+            "<b>ငါသည် Group များအတွက် Tag - Mention Bot တစ်ခုဖြစ်တယ်။ ငါ၏လုပ်နိုင်စွမ်းကို ကောင်းကောင်းအသုံးချပါ။</b>\n\n"
             "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
             "<b>📌 ငါ၏လုပ်နိုင်စွမ်း</b>\n\n"
             "✅ Tag Mention (LawSpeaker) / Group mention helper\n\n"
@@ -648,10 +647,9 @@ async def donate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if bot_username else bot_name
         )
         start_text = (
-            f"<b>────「 {bot_mention} 」────</b>\n\n"
+            f"<b>────「 {bot_mention} 」</b>\n\n"
             f"<b>ဟယ်လို {user_mention} ! 👋</b>\n\n"
-            "<b>ငါသည် Group များအတွက် Tag Mention Bot တစ်ခုဖြစ်တယ်။</b>\n"
-            "<b>ငါ၏လုပ်နိုင်စွမ်းကို ကောင်းကောင်းအသုံးချပါ။</b>\n\n"
+            "<b>ငါသည် Group များအတွက် Tag - Mention Bot တစ်ခုဖြစ်တယ်။ ငါ၏လုပ်နိုင်စွမ်းကို ကောင်းကောင်းအသုံးချပါ။</b>\n\n"
             "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
             "<b>📌 ငါ၏လုပ်နိုင်စွမ်း</b>\n\n"
             "✅ Tag Mention (LawSpeaker) / Group mention helper\n\n"
