@@ -1824,7 +1824,7 @@ async def mention_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         ids.append(int(u.id))
     ids = list(dict.fromkeys(ids))
-    await _send_mentions_in_chunks(msg, ids, text)
+    await _send_mentions_in_chunks(context, msg, ids, text)
 
 async def mention_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, raw = await _mention_common_guard(update, context)
@@ -1836,7 +1836,7 @@ async def mention_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ids = await get_all_members(chat.id)
     # remove bot id if present
     ids = [i for i in ids if i != context.bot.id]
-    await _send_mentions_in_chunks(msg, ids, text)
+    await _send_mentions_in_chunks(context, msg, ids, text)
 
 async def mention_everyone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # alias of /all
@@ -1848,7 +1848,7 @@ async def mention_everyone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = raw.replace("/everyone", "", 1).strip()
     ids = await get_all_members(chat.id)
     ids = [i for i in ids if i != context.bot.id]
-    await _send_mentions_in_chunks(msg, ids, text)
+    await _send_mentions_in_chunks(context, msg, ids, text)
 
 async def mention_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, raw = await _mention_common_guard(update, context)
@@ -1859,26 +1859,36 @@ async def mention_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = raw.replace("/call", "", 1).strip()
     ids = await get_active_members(chat.id)
     ids = [i for i in ids if i != context.bot.id]
-    await _send_mentions_in_chunks(msg, ids, text)
+    await _send_mentions_in_chunks(context, msg, ids, text)
 
-async def _send_mentions_in_chunks(msg, user_ids: list[int], text: str):
+async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user_ids: list[int], text: str):
     # empty list guard
     if not user_ids:
-        await msg.reply_text("⚠️ Member list မရှိသေးပါ။ (အနည်းငယ် message တွေပြောပြီးမှ /all လုပ်ပါ)")
+        await context.bot.send_message(chat_id=msg.chat_id,text="⚠️ Member list မရှိသေးပါ။ (အနည်းငယ် message တွေပြောပြီးမှ Mention လုပ်ပါ)"
+        )
         return
     # chunk 7 each message
     for i in range(0, len(user_ids), EMOJIS_PER_MESSAGE):
         chunk = user_ids[i:i+EMOJIS_PER_MESSAGE]
         line = build_emoji_mentions(chunk)
         if text:
-            body = f"{escape(text)}\n{line}"
+            body = f"{escape(text)}\n\n{line}"
         else:
             body = f"{line}"
         try:
-            await msg.reply_text(body, parse_mode="HTML", disable_web_page_preview=True)
+           await context.bot.send_message(
+               chat_id=msg.chat_id,
+               text=body,
+               parse_mode="HTML",
+               disable_web_page_preview=True,
+               reply_to_message_id=None
+           )
         except Exception:
             # fallback plain text (mentions might not work)
-            await msg.reply_text((text + "\n" if text else "") + " ".join(["🙂"]*len(chunk)))
+            await context.bot.send_message(
+                chat_id=msg.chat_id,
+                text=((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
+            )
         await asyncio.sleep(0.7)  # reduce flood
 
 async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
