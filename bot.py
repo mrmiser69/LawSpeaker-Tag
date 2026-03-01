@@ -536,11 +536,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<b>ငါ၏လုပ်နိုင်စွမ်းကို ကောင်းကောင်းအသုံးချပါ။</b>\n\n"
             "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
             "<b>📌 ငါ၏လုပ်နိုင်စွမ်း</b>\n\n"
-            "✅ Tag Mention (LawSpeaker) / Group mention helper\n\n"
+            "<blockquote>"
+            "✅ Auto Forward Delete (Setting မလို)\n"
+            "✅ Spam Forward Mute (Forward 3 ခါ = 10 မိနစ် mute)"
+            "✅ Tag Mention (LawSpeaker) / Group mention helper"
+            "</blockquote>\n\n"
             "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
             "<b>📥 ငါ့ကိုအသုံးပြုရန်</b>\n\n"
+            "<blockquote>"
             "➕ ငါ့ကို Group ထဲထည့်ပါ\n"
             "⭐️ ငါ့ကို Admin ပေးပါ"
+            "</blockquote>"
         )
 
         buttons = []
