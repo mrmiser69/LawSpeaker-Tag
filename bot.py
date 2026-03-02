@@ -1935,10 +1935,15 @@ async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user
     for i in range(0, len(user_ids), EMOJIS_PER_MESSAGE):
         chunk = user_ids[i:i+EMOJIS_PER_MESSAGE]
         line = build_emoji_mentions(chunk)
+        is_last_chunk = (i + EMOJIS_PER_MESSAGE) >= len(user_ids)
         if text:
             body = f"{escape(text)}\n\n{line}"
         else:
             body = f"{line}"
+        
+        # ✅ Add footer only on LAST mention message
+        if is_last_chunk:
+            body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး。\n@MMTelegramBotss"
         try:
            await context.bot.send_message(
                chat_id=msg.chat_id,
