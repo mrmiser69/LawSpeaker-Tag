@@ -217,6 +217,64 @@ def rate_limited_log(key: str, message: str):
         LOG_RATE_CACHE[key] = now
         print(message)
 
+# ===============================
+# /help (MONOSPACE + CLOSE BUTTON)
+# ===============================
+HELP_MONO_RAW = """📌 ငါ၏လုပ်နိုင်စွမ်း
+
+1. Group Member များကို Tag - Mention ခေါ်ပေးနိုင်ခြင်း။
+
+2. Group Admin များကို Tag - Mention ခေါ်ပေးနိုင်ခြင်း။
+
+3. Active Member များကို Tag - Mention ခေါ်ပေးနိုင်ခြင်း။
+
+4. Group Member များအသုံးပြုခွင့် နှင့် Tag - Mention ခေါ်ဆောင်ခွင့်မရှိခြင်း။
+
+5. Group Owner နှင့် Admin များသာ အသုံးပြုခွင့် နှင့် Tag - Mention ခေါ်ဆောင်ခွင့်ရှိခြင်း။
+
+
+📌 အသုံးပြုနည်း
+
+/all [စာသား] -> Member အားလုံးကိုခေါ်ရန်။
+
+/everyone [စာသား] -> /all နဲ့အတူတူပဲ။
+
+/call [စာသား] -> Group မှာ Active ဖြစ်နေတဲ့ Member အားလုံးကိုခေါ်ရန်။
+
+/admins [စာသား] -> Group admin အားလုံးကိုခေါ်ရန်။
+
+/stop -> Mention ခေါ်နေတာကိုရပ်တန့်ရန်။
+"""
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg:
+        return
+    # HTML-safe monospace
+    pre = f"<pre>{escape(HELP_MONO_RAW)}</pre>"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Close", callback_data="help_close")]
+    ])
+    # send in BOTH private + group
+    await msg.reply_text(pre, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+
+async def help_close_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.message:
+        return
+    await q.answer()
+    # Try delete (works in private, and in groups if bot can delete)
+    try:
+        await q.message.delete()
+        return
+    except Exception:
+        pass
+    # fallback: just remove content + keyboard
+    try:
+        await q.message.edit_text("✅ Closed")
+    except Exception:
+        pass
+
 def clear_reminders(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     job_queue = context.job_queue
     if job_queue is None:
@@ -1922,6 +1980,7 @@ def main():
 
     # Commands
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("refresh", refresh))
     app.add_handler(CommandHandler("refresh_all", refresh_all))
@@ -1941,6 +2000,9 @@ def main():
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
+    # Help close button
+    app.add_handler(CallbackQueryHandler(help_close_cb, pattern=r"^help_close$"))
+    
     # Chat member
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
