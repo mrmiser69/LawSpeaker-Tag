@@ -1858,7 +1858,7 @@ async def _mention_common_guard(update: Update, context: ContextTypes.DEFAULT_TY
         mention = f"<a href='tg://user?id={user.id}'>{name}</a>"
 
         await msg.reply_text(
-            f"⚠️ {mention} မင်းမှာ ဒီ Command သုံးရန် permission မရှိပါ။",
+            f"⚠️ {mention} မင်းမှာ ဒီ Command သုံးရန် ခွင့်ပြုချက်မရှိပါ။ ခွင့်ပြုချက်လိုချင်ရင် ဆရာကြီး 3 ခါခေါ်ပါ ။",
             parse_mode="HTML"
         )
         return False, ""
@@ -1961,7 +1961,6 @@ async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user
                chat_id=msg.chat_id,
                text=body,
                parse_mode="HTML",
-               disable_web_page_preview=True,
                reply_to_message_id=None
            )
         except Exception:
