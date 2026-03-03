@@ -1836,8 +1836,13 @@ async def stop_mentions(update: Update, context: ContextTypes.DEFAULT_TYPE):
       "ON CONFLICT(chat_id) DO UPDATE SET stopped_by=excluded.stopped_by, stopped_by_name=excluded.stopped_by_name, stopped_at=excluded.stopped_at",
       (chat.id, user.id, user.full_name or "", int(time.time()))
     )
-    who = escape(user.full_name or "Admin")
-    await msg.reply_text(f"⛔ Mention ကို <b>{who}</b> က ရပ်လိုက်ပါတယ်။", parse_mode="HTML")
+    name = escape(user.first_name or "User")
+    mention = f"<a href='tg://user?id={user.id}'>{name}</a>"
+
+    await msg.reply_text(
+        f"⛔ Mention ကို {mention} က ရပ်လိုက်ပါတယ်။",
+        parse_mode="HTML"
+    )
 
 async def _mention_common_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[bool, str]:
     chat = update.effective_chat
@@ -1849,8 +1854,15 @@ async def _mention_common_guard(update: Update, context: ContextTypes.DEFAULT_TY
         return False, ""
     # admin-only
     if not await is_group_admin_or_creator(chat.id, user.id, context):
-        await msg.reply_text("⚠️ မင်းမှာ ဒီ Command သုံးရန် permission မရှိပါ။")
+        name = escape(user.first_name or "User")
+        mention = f"<a href='tg://user?id={user.id}'>{name}</a>"
+
+        await msg.reply_text(
+            f"⚠️ {mention} မင်းမှာ ဒီ Command သုံးရန် permission မရှိပါ။",
+            parse_mode="HTML"
+        )
         return False, ""
+    
     # bot must be admin
     if not await can_bot_work_for_mentions(chat.id, context):
         await msg.reply_text(
@@ -1943,7 +1955,7 @@ async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user
         
         # ✅ Add footer only on LAST mention message
         if is_last_chunk:
-            body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး。\n@MMTelegramBotss"
+            body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
         try:
            await context.bot.send_message(
                chat_id=msg.chat_id,
