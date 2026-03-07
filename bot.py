@@ -218,6 +218,23 @@ def rate_limited_log(key: str, message: str):
         print(message)
 
 # ===============================
+# ADMIN LIST COLLECT
+# ===============================
+async def collect_admins(chat_id: int, bot_or_ctx):
+    try:
+        bot = getattr(bot_or_ctx, "bot", bot_or_ctx)
+        admins = await bot.get_chat_administrators(chat_id)
+    except Exception:
+        return
+
+    for admin in admins:
+        user = admin.user
+        if not user or user.is_bot:
+            continue
+
+        await upsert_member_activity(chat_id, user.id)
+
+# ===============================
 # /help (MONOSPACE + CLOSE BUTTON)
 # ===============================
 HELP_MONO_RAW = """📌 ငါ၏လုပ်နိုင်စွမ်း
@@ -1647,6 +1664,8 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     (chat_id, int(time.time()))
                 )
             )
+            # ✅ also collect current admins into member list
+            context.application.create_task(collect_admins(chat_id, context))        
         else:
             await msg.reply_text(
                 "⚠️ <b>Bot မှာ Admin permission မရှိပါ</b>\n\n"
@@ -1695,6 +1714,8 @@ async def refresh_admin_cache(app):
                     """,
                     (now, gid)
                 )
+                # ✅ collect admins of active groups into member list
+                await collect_admins(gid, app)            
             else:
                 skipped += 1
                 await safe_db_execute(
@@ -1793,6 +1814,7 @@ async def refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if me.status in ("administrator", "creator") and getattr(me, "can_delete_messages", False):
                 BOT_ADMIN_CACHE.add(gid)
                 verified += 1
+                await collect_admins(gid, context)
             else:
                 skipped += 1
         except Exception as e:
@@ -1957,7 +1979,7 @@ async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user
         if is_last_chunk:
             body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
         try:
-           await context.bot.send_message(
+            await context.bot.send_message(
                chat_id=msg.chat_id,
                text=body,
                parse_mode="HTML",
@@ -1983,6 +2005,31 @@ async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # record only real messages
     await upsert_member_activity(chat.id, user.id)
+
+# ===============================
+# MEMBER JOIN TRACK
+# ===============================
+async def track_member_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    cm = getattr(update, "chat_member", None)
+
+    if not chat or not cm:
+        return
+
+    old = cm.old_chat_member
+    new = cm.new_chat_member
+    if not old or not new:
+        return
+
+    user = new.user
+    if not user or user.is_bot:
+        return
+
+    old_status = old.status
+    new_status = new.status
+
+    if old_status in ("left", "kicked") and new_status in ("member", "administrator", "creator"):
+        await upsert_member_activity(chat.id, user.id)
 
 # ===============================
 # MAIN
@@ -2011,6 +2058,9 @@ def main():
     # Track member activity (build list over time)
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, track_activity), group=1)
     
+    # Join event tracking
+    app.add_handler(ChatMemberHandler(track_member_join, ChatMemberHandler.CHAT_MEMBER))
+
     # Donate / Payments
     app.add_handler(CallbackQueryHandler(donate_callback, pattern=r"^donate"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
@@ -2086,6 +2136,15 @@ def main():
             print("✅ DB init done", flush=True)
             now = await refresh_admin_cache(app)
             print("✅ Admin cache refreshed", flush=True)
+
+        # collect admins from all known groups (extra safety)
+        rows = await safe_db_execute("SELECT group_id FROM groups", fetch=True) or []
+        for r in rows:
+            try:
+                await collect_admins(int(r["group_id"]), app)
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
 
         print("🤖 LawSpeaker Tag Bot running (PRODUCTION READY)", flush=True)
     
