@@ -30,6 +30,7 @@ from telegram.ext import (
 )
 
 from psycopg_pool import ConnectionPool  # ✅ ONLY THIS (Supabase safe)
+from telethon import TelegramClient
 
 # ===============================
 # CONFIG / CONSTANTS
@@ -37,6 +38,10 @@ from psycopg_pool import ConnectionPool  # ✅ ONLY THIS (Supabase safe)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 START_IMAGE = "https://i.postimg.cc/Z50C1r4y/Untitled-design-(23).png"
+
+TG_API_ID = int(os.getenv("TG_API_ID", "0"))
+TG_API_HASH = os.getenv("TG_API_HASH")
+TG_SESSION = os.getenv("TG_SESSION", "lawspeaker_userbot")
 
 DB_HOST = os.getenv("SUPABASE_HOST")
 DB_NAME = os.getenv("SUPABASE_DB")
@@ -66,6 +71,30 @@ EMOJI_POOL = [
   "🎯","🎮","🎵","🎧","📌","📣","📢","🚀","🧨","🛡️","🧠","🫶","🙏","🤝"
 ]
 
+async def collect_members_mtproto(chat_id: int):
+    members = []
+
+    if not user_client:
+        return members
+
+    try:
+        async for user in user_client.iter_participants(chat_id):
+            if not user.bot:
+                members.append(user.id)
+    except Exception as e:
+        print(f"MTProto collect error: {e}", flush=True)
+
+    return members
+
+async def sync_members_mtproto(chat_id: int):
+    members = await collect_members_mtproto(chat_id)
+
+    for uid in members:
+        try:
+            await upsert_member_activity(chat_id, uid)
+        except:
+            pass
+
 # ===============================
 # GLOBAL CACHES / STATE
 # ===============================
@@ -90,11 +119,14 @@ ADMIN_VERIFY_SECONDS = 60
 LAST_MENTION_TS: dict[int, int] = {}   # chat_id -> ts
 STOPPED_CHATS: set[int] = set()        # chat_id stopped by /stop
 
+user_client = None
+
 # ===============================
 # DB POOL + DB EXEC
 # ===============================
 pool = None
 DB_READY = False
+user_client = None
 
 async def db_execute(query, params=None, fetch=False):
     loop = asyncio.get_running_loop()
@@ -1532,6 +1564,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if (new.user.id == bot_id and new.status == "member" and old.status in ("left", "kicked")):
+        context.application.create_task(sync_members_mtproto(chat.id))
         BOT_ADMIN_CACHE.discard(chat.id)
         clear_reminders(context, chat.id)
         # ✅ Save non-admin group too (stay in group; no auto-leave)
@@ -2093,6 +2126,19 @@ def main():
     async def on_startup(app):
         global pool
         print("🟡 Starting bot...", flush=True)
+    
+        global user_client
+
+        from telethon.sessions import StringSession
+
+        user_client = TelegramClient(
+            StringSession(TG_SESSION),
+            TG_API_ID,
+            TG_API_HASH
+        )
+
+        await user_client.start()
+        print("✅ Userbot connected", flush=True)
 
         await app.bot.delete_webhook(drop_pending_updates=True)
 
