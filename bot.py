@@ -639,7 +639,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<b>────「 {bot_mention} 」</b>\n\n"
             f"<b>ဟယ်လို {user_mention} ! 👋</b>\n\n"
             "<b>ငါသည် Group များအတွက်</b>\n"
-            "<b>Tag Mention Bot တစ်ခုဖြစ်တယ်။</b>\n"
+            "<b>Tag Mention Bot တစ်ခုဖြစ်ပါတယ်။</b>\n"
             "<b>ငါ၏လုပ်နိုင်စွမ်းကို ကောင်းကောင်းအသုံးချပါ။</b>\n\n"
             "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
             "<blockquote>"
