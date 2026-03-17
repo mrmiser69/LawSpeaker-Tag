@@ -30,7 +30,6 @@ from telegram.ext import (
 )
 
 from psycopg_pool import ConnectionPool  # ✅ ONLY THIS (Supabase safe)
-from telethon import TelegramClient
 
 # ===============================
 # CONFIG / CONSTANTS
@@ -41,7 +40,7 @@ START_IMAGE = "https://i.postimg.cc/Z50C1r4y/Untitled-design-(23).png"
 
 TG_API_ID = int(os.getenv("TG_API_ID", "0"))
 TG_API_HASH = os.getenv("TG_API_HASH")
-TG_SESSION = os.getenv("TG_SESSION", "lawspeaker_userbot")
+TG_SESSION = os.getenv("TG_SESSION")
 
 DB_HOST = os.getenv("SUPABASE_HOST")
 DB_NAME = os.getenv("SUPABASE_DB")
@@ -72,28 +71,90 @@ EMOJI_POOL = [
 ]
 
 async def collect_members_mtproto(chat_id: int):
-    members = []
 
     if not user_client:
-        return members
+        return
 
     try:
-        async for user in user_client.iter_participants(chat_id):
+        async for user in user_client.iter_participants(
+            chat_id,
+            aggressive=False
+        ):
             if not user.bot:
-                members.append(user.id)
+                yield user.id
+    
     except Exception as e:
         print(f"MTProto collect error: {e}", flush=True)
 
-    return members
-
-async def sync_members_mtproto(chat_id: int):
-    members = await collect_members_mtproto(chat_id)
-
-    for uid in members:
+async def sync_members_mtproto(chat_id: int):   
+    batch = []
+    total = 0
+    
+    async for uid in collect_members_mtproto(chat_id):
         try:
-            await upsert_member_activity(chat_id, uid)
+            batch.append(uid)
+            total += 1
+
+            if len(batch) >= 500:
+                for u in batch:
+                    await upsert_member_activity(chat_id, u)
+                batch.clear()
         except:
             pass
+
+        # yield control (prevent event loop freeze)
+        await asyncio.sleep(0)
+    
+    if batch:
+        for u in batch:
+            try:
+                await upsert_member_activity(chat_id, u)
+            except:
+                pass
+
+    return total
+
+async def sync_members_silent(chat_id: int):
+    if chat_id in SYNCING_CHATS:
+        return
+
+    SYNCING_CHATS.add(chat_id)
+    try:
+        await sync_members_mtproto(chat_id)
+    except Exception as e:
+        print(f"Silent sync error: {e}", flush=True)
+    finally:
+        SYNCING_CHATS.discard(chat_id)
+
+
+async def sync_and_notify_ready(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    if chat_id in SYNCING_CHATS:
+        return
+
+    SYNCING_CHATS.add(chat_id)
+    try:
+        count = await sync_members_mtproto(chat_id)
+ 
+        # send ready only if bot is STILL admin
+        try:
+            me = await context.bot.get_chat_member(chat_id, context.bot.id)
+            if me.status not in ("administrator", "creator"):
+                return
+        except Exception:
+            return
+
+        await context.bot.send_message(
+            chat_id,
+            "✅ <b>Member list စုပြီးပါပြီ</b>\n\n"
+            f"👥 Synced Members: <b>{count}</b>\n\n"
+            "📣 /all /everyone /call ကို အခုသုံးလို့ရပါပြီ။",
+            parse_mode="HTML"
+        )
+
+    except Exception as e:
+        print(f"Sync notify error: {e}", flush=True)
+    finally:
+        SYNCING_CHATS.discard(chat_id)
 
 # ===============================
 # GLOBAL CACHES / STATE
@@ -118,8 +179,7 @@ ADMIN_VERIFY_SECONDS = 60
 # Tag mention runtime caches (DB down ok)
 LAST_MENTION_TS: dict[int, int] = {}   # chat_id -> ts
 STOPPED_CHATS: set[int] = set()        # chat_id stopped by /stop
-
-user_client = None
+SYNCING_CHATS: set[int] = set()        # prevent duplicate sync per chat
 
 # ===============================
 # DB POOL + DB EXEC
@@ -277,7 +337,7 @@ HELP_MONO_RAW = """📌 ငါ၏လုပ်နိုင်စွမ်း
 
 3. Active Member များကို Tag - Mention ခေါ်ပေးနိုင်ခြင်း။
 
-4. Group Member များအသုံးပြုခွင့် နှင့် Tag - Mention ခေါ်ဆောင်ခွင့်မရှိခြင်း။
+4. Group Member များသည် Bot ကို Group ထဲအသုံးပြုခွင့် နှင့် Tag - Mention ခေါ်ဆောင်ခွင့်မရှိခြင်း။
 
 5. Group Owner နှင့် Admin များသာ အသုံးပြုခွင့် နှင့် Tag - Mention ခေါ်ဆောင်ခွင့်ရှိခြင်း။
 
@@ -458,6 +518,45 @@ async def get_all_members(chat_id: int) -> list[int]:
       (chat_id,), fetch=True
     ) or []
     return [int(r[0]) for r in rows2]
+
+async def iter_all_members(chat_id: int, batch_size: int = 700):
+    """
+    Stream members from DB/SQLite without loading the whole list into RAM.
+    700 = 100 mention messages worth (7 per message).
+    """
+    if DB_READY:
+        offset = 0
+        while True:
+            rows = await safe_db_execute(
+                "SELECT user_id FROM members WHERE chat_id=%s "
+                "ORDER BY last_seen DESC LIMIT %s OFFSET %s",
+                (chat_id, batch_size, offset),
+                fetch=True
+            )
+            if not rows:
+                break
+            for r in rows:
+                uid = int(r["user_id"])
+                if uid != 0:
+                    yield uid
+            offset += batch_size
+        return
+
+    offset = 0
+    while True:
+        rows = await sqlite_execute(
+            "SELECT user_id FROM members WHERE chat_id=? "
+            "ORDER BY last_seen DESC LIMIT ? OFFSET ?",
+            (chat_id, batch_size, offset),
+            fetch=True
+        ) or []
+        if not rows:
+            break
+        for r in rows:
+            uid = int(r[0])
+            if uid != 0:
+                yield uid
+        offset += batch_size
 
 async def get_active_members(chat_id: int) -> list[int]:
     now = int(time.time())
@@ -769,9 +868,10 @@ async def donate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<b>📌 ငါ၏လုပ်နိုင်စွမ်းများ နှင့် အသုံးပြုနည်းများကို /help ကို နှိပ်၍ကြည့်နိုင်ပါတယ်။</b>"
             "</blockquote>\n\n"
             "➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
-            "<b>📥 ငါ့ကိုအသုံးပြုရန်</b>\n\n"
+            "<blockquote>"
             "➕ ငါ့ကို Group ထဲထည့်ပါ\n"
             "⭐️ ငါ့ကို Admin ပေးပါ"
+            "</blockquote>"
         )
         buttons = []
         if bot_username:
@@ -1518,6 +1618,8 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_id = context.bot.id
 
     if (new.user.id == bot_id and new.status == "administrator" and old.status != "administrator"):
+        context.application.create_task(sync_and_notify_ready(chat.id, context))
+
         is_ok = getattr(new, "can_delete_messages", False)
         if is_ok:
             BOT_ADMIN_CACHE.add(chat.id)
@@ -1550,11 +1652,12 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat.id,
                 "✅ <b>Thank you!</b>\n\n"
-                "🤖 Bot ကို <b>Admin</b> အဖြစ် ခန့်ထားပြီးပါပြီး။\n"
-                "🏷️ LawSpeaker Tag Mention စနစ် စတင်အလုပ်လုပ်နေပါပြီး.........!",
+                "🤖 Bot ကို <b>Admin</b> အဖြစ် ခန့်ထားပြီးပါပြီး။\n\n"
+                "⏳ <b>Member list စုနေပါတယ်...</b>\n"
+                "ခဏစောင့်ပြီးမှ <b>/all /everyone /call</b> ကို သုံးပါ။",
                 parse_mode="HTML"
             )
-        except:
+        except Exception:
             pass
         return
 
@@ -1564,7 +1667,8 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if (new.user.id == bot_id and new.status == "member" and old.status in ("left", "kicked")):
-        context.application.create_task(sync_members_mtproto(chat.id))
+        context.application.create_task(sync_members_silent(chat.id))
+        
         BOT_ADMIN_CACHE.discard(chat.id)
         clear_reminders(context, chat.id)
         # ✅ Save non-admin group too (stay in group; no auto-leave)
@@ -1964,10 +2068,12 @@ async def mention_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     msg = update.effective_message
     text = raw.replace("/all", "", 1).strip()
-    ids = await get_all_members(chat.id)
-    # remove bot id if present
-    ids = [i for i in ids if i != context.bot.id]
-    await _send_mentions_in_chunks(context, msg, ids, text)
+    await _send_mentions_streaming(
+        context,
+        msg,
+        iter_all_members(chat.id, batch_size=300),
+        text
+    )
 
 async def mention_everyone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # alias of /all
@@ -1977,9 +2083,12 @@ async def mention_everyone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     msg = update.effective_message
     text = raw.replace("/everyone", "", 1).strip()
-    ids = await get_all_members(chat.id)
-    ids = [i for i in ids if i != context.bot.id]
-    await _send_mentions_in_chunks(context, msg, ids, text)
+    await _send_mentions_streaming(
+        context,
+        msg,
+        iter_all_members(chat.id, batch_size=300),
+        text
+    )
 
 async def mention_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, raw = await _mention_common_guard(update, context)
@@ -1992,13 +2101,80 @@ async def mention_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ids = [i for i in ids if i != context.bot.id]
     await _send_mentions_in_chunks(context, msg, ids, text)
 
+async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_iter, text: str):
+    chunk = []
+    sent_any = False
+    sent_count = 0
+
+    async for uid in id_iter:
+        if uid == context.bot.id:
+            continue
+        chunk.append(uid)
+
+        if len(chunk) == EMOJIS_PER_MESSAGE:
+            line = build_emoji_mentions(chunk)
+            body = f"{escape(text)}\n\n{line}" if text else line
+            try:
+                await context.bot.send_message(
+                    chat_id=msg.chat_id,
+                    text=body,
+                    parse_mode="HTML",
+                    reply_to_message_id=None
+                )
+            except Exception:
+                await context.bot.send_message(
+                    chat_id=msg.chat_id,
+                    text=((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
+                )
+            sent_any = True
+            sent_count += 1
+            chunk = []
+            if sent_count % 5 == 0:
+                await asyncio.sleep(1.2)
+            else:
+                await asyncio.sleep(0.15)
+
+    if chunk:
+        line = build_emoji_mentions(chunk)
+        body = f"{escape(text)}\n\n{line}" if text else line
+        body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
+        try:
+            await context.bot.send_message(
+                chat_id=msg.chat_id,
+                text=body,
+                parse_mode="HTML",
+                reply_to_message_id=None
+            )
+        except Exception:
+            await context.bot.send_message(
+                chat_id=msg.chat_id,
+                text=((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
+            )
+        sent_any = True
+    elif sent_any:
+        try:
+            await context.bot.send_message(
+                chat_id=msg.chat_id,
+                text="ခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
+            )
+        except Exception:
+            pass
+    else:
+        await context.bot.send_message(
+            chat_id=msg.chat_id,
+            text="⚠️ Member list မရှိသေးပါ။ (အနည်းငယ် message တွေပြောပြီးမှ Mention လုပ်ပါ)"
+        )
+
 async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user_ids: list[int], text: str):
     # empty list guard
     if not user_ids:
-        await context.bot.send_message(chat_id=msg.chat_id,text="⚠️ Member list မရှိသေးပါ။ (အနည်းငယ် message တွေပြောပြီးမှ Mention လုပ်ပါ)"
+        await context.bot.send_message(
+            chat_id=msg.chat_id,
+            text="⚠️ Member list မရှိသေးပါ။ (အနည်းငယ် message တွေပြောပြီးမှ Mention လုပ်ပါ)"
         )
         return
     # chunk 7 each message
+    sent_count = 0
     for i in range(0, len(user_ids), EMOJIS_PER_MESSAGE):
         chunk = user_ids[i:i+EMOJIS_PER_MESSAGE]
         line = build_emoji_mentions(chunk)
@@ -2024,7 +2200,11 @@ async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user
                 chat_id=msg.chat_id,
                 text=((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
             )
-        await asyncio.sleep(0.7)  # reduce flood
+        sent_count += 1
+        if sent_count % 5 == 0:
+            await asyncio.sleep(1.2)
+        else:
+            await asyncio.sleep(0.15)
 
 async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -2129,16 +2309,21 @@ def main():
     
         global user_client
 
-        from telethon.sessions import StringSession
+        if TG_API_ID and TG_API_HASH and TG_SESSION:
+            from telethon import TelegramClient
+            from telethon.sessions import StringSession
 
-        user_client = TelegramClient(
-            StringSession(TG_SESSION),
-            TG_API_ID,
-            TG_API_HASH
-        )
+            user_client = TelegramClient(
+                StringSession(TG_SESSION),
+                TG_API_ID,
+                TG_API_HASH
+            )
 
-        await user_client.start()
-        print("✅ Userbot connected", flush=True)
+            await user_client.start()
+            print("✅ Userbot connected", flush=True)
+        else:
+            user_client = None
+            print("⚠️ Userbot disabled: missing TG_API_ID / TG_API_HASH / TG_SESSION", flush=True)
 
         await app.bot.delete_webhook(drop_pending_updates=True)
 
