@@ -26,6 +26,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
     ChatMemberHandler,
+    ChatJoinRequestHandler,
     PreCheckoutQueryHandler,
 )
 
@@ -37,10 +38,6 @@ from psycopg_pool import ConnectionPool  # ✅ ONLY THIS (Supabase safe)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 START_IMAGE = "https://i.postimg.cc/Z50C1r4y/Untitled-design-(23).png"
-
-TG_API_ID = int(os.getenv("TG_API_ID", "0"))
-TG_API_HASH = os.getenv("TG_API_HASH")
-TG_SESSION = os.getenv("TG_SESSION")
 
 DB_HOST = os.getenv("SUPABASE_HOST")
 DB_NAME = os.getenv("SUPABASE_DB")
@@ -70,62 +67,98 @@ EMOJI_POOL = [
   "🎯","🎮","🎵","🎧","📌","📣","📢","🚀","🧨","🛡️","🧠","🫶","🙏","🤝"
 ]
 
-async def collect_members_mtproto(chat_id: int):
-
-    if not user_client:
+async def maybe_collect_message_members(msg):
+    """
+    Fastest Bot-API-side collection from service message payloads.
+    """
+    if not msg:
         return
 
-    try:
-        async for user in user_client.iter_participants(
-            chat_id,
-            aggressive=False
-        ):
-            if not user.bot:
-                yield user.id
-    
-    except Exception as e:
-        print(f"MTProto collect error: {e}", flush=True)
+    chat = getattr(msg, "chat", None)
+    if not chat or chat.type not in ("group", "supergroup"):
+        return
 
-async def sync_members_mtproto(chat_id: int):   
-    batch = []
-    total = 0
+    new_members = getattr(msg, "new_chat_members", None) or []
+    if new_members:
+        ids = [u.id for u in new_members if u]
+        await upsert_member_batch(chat.id, ids)
+
+    left_member = getattr(msg, "left_chat_member", None)
+    if left_member:
+        await upsert_member_activity(chat.id, left_member.id)
+
+async def maybe_collect_related_users(msg):
+    """
+    Safe Bot-API collection from visible message-related users only.
+    No userbot, no hidden-member access.
+    """
+    if not msg:
+        return
+
+    chat = getattr(msg, "chat", None)
+    if not chat or chat.type not in ("group", "supergroup"):
+        return
+
+    seen = set()
+    collected_ids = []
     
-    async for uid in collect_members_mtproto(chat_id):
+    async def add_user(u):
+        if not u:
+            return
+        uid = getattr(u, "id", None)
+        if not uid or uid in seen:
+            return
+        seen.add(uid)
+        collected_ids.append(int(uid))
+
+    # sender
+    await add_user(getattr(msg, "from_user", None))
+
+    # replied user
+    reply = getattr(msg, "reply_to_message", None)
+    if reply:
+        await add_user(getattr(reply, "from_user", None))
+
+        for u in (getattr(reply, "new_chat_members", None) or []):
+            await add_user(u)
+
+        await add_user(getattr(reply, "left_chat_member", None))
+
+        # pinned message inside reply
+        pinned2 = getattr(reply, "pinned_message", None)
+        if pinned2:
+            await add_user(getattr(pinned2, "from_user", None))
+            for u in (getattr(pinned2, "new_chat_members", None) or []):
+                await add_user(u)
+            await add_user(getattr(pinned2, "left_chat_member", None))
+
+    # pinned message on current message
+    pinned = getattr(msg, "pinned_message", None)
+    if pinned:
+        await add_user(getattr(pinned, "from_user", None))
+        for u in (getattr(pinned, "new_chat_members", None) or []):
+            await add_user(u)
+        await add_user(getattr(pinned, "left_chat_member", None))
+
+    # text mentions in message entities
+    for ent in (getattr(msg, "entities", None) or []):
+        if getattr(ent, "type", None) == "text_mention":
+            await add_user(getattr(ent, "user", None))
+
+    # text mentions in caption entities
+    for ent in (getattr(msg, "caption_entities", None) or []):
+        if getattr(ent, "type", None) == "text_mention":
+            await add_user(getattr(ent, "user", None))
+
+    # 🔥 BULK insert (massively faster)
+    if collected_ids:
         try:
-            batch.append(uid)
-            total += 1
-
-            if len(batch) >= 500:
-                for u in batch:
-                    await upsert_member_activity(chat_id, u)
-                batch.clear()
-        except:
+            await upsert_member_batch(chat.id, collected_ids)
+        except Exception:
             pass
 
-        # yield control (prevent event loop freeze)
-        await asyncio.sleep(0)
-    
-    if batch:
-        for u in batch:
-            try:
-                await upsert_member_activity(chat_id, u)
-            except:
-                pass
-
-    return total
-
 async def sync_members_silent(chat_id: int):
-    if chat_id in SYNCING_CHATS:
-        return
-
-    SYNCING_CHATS.add(chat_id)
-    try:
-        await sync_members_mtproto(chat_id)
-    except Exception as e:
-        print(f"Silent sync error: {e}", flush=True)
-    finally:
-        SYNCING_CHATS.discard(chat_id)
-
+    return
 
 async def sync_and_notify_ready(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     if chat_id in SYNCING_CHATS:
@@ -133,28 +166,35 @@ async def sync_and_notify_ready(chat_id: int, context: ContextTypes.DEFAULT_TYPE
 
     SYNCING_CHATS.add(chat_id)
     try:
-        count = await sync_members_mtproto(chat_id)
- 
-        # send ready only if bot is STILL admin
+        # Fast backfill only from admin list
         try:
-            me = await context.bot.get_chat_member(chat_id, context.bot.id)
-            if me.status not in ("administrator", "creator"):
-                return
+            await collect_admins(chat_id, context)
         except Exception:
-            return
-
-        await context.bot.send_message(
-            chat_id,
-            "✅ <b>Member list စုပြီးပါပြီ</b>\n\n"
-            f"👥 Synced Members: <b>{count}</b>\n\n"
-            "📣 /all /everyone /call ကို အခုသုံးလို့ရပါပြီ။",
-            parse_mode="HTML"
-        )
-
-    except Exception as e:
-        print(f"Sync notify error: {e}", flush=True)
+            pass
+    except Exception:
+        pass
     finally:
         SYNCING_CHATS.discard(chat_id)
+
+async def fast_warmup_collect(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """
+    🔥 Burst mode: collect as many visible users as possible quickly
+    without waiting long activity cycles.
+    """
+    try:
+        admins = await context.bot.get_chat_administrators(chat_id)
+        ids = []
+
+        for a in admins:
+            u = getattr(a, "user", None)
+            if u:
+                ids.append(u.id)
+
+        # bulk insert admins (faster)
+        await upsert_member_batch(chat_id, ids)
+
+    except Exception:
+        pass
 
 # ===============================
 # GLOBAL CACHES / STATE
@@ -186,7 +226,6 @@ SYNCING_CHATS: set[int] = set()        # prevent duplicate sync per chat
 # ===============================
 pool = None
 DB_READY = False
-user_client = None
 
 async def db_execute(query, params=None, fetch=False):
     loop = asyncio.get_running_loop()
@@ -321,7 +360,7 @@ async def collect_admins(chat_id: int, bot_or_ctx):
 
     for admin in admins:
         user = admin.user
-        if not user or user.is_bot:
+        if not user:
             continue
 
         await upsert_member_activity(chat_id, user.id)
@@ -446,6 +485,17 @@ async def get_admin_set(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         return ADMIN_LIST_CACHE.get(chat_id, set()), False
 
+async def periodic_member_sync(app):
+    while True:
+        try:
+            for chat_id in list(BOT_ADMIN_CACHE):
+                app.create_task(sync_members_silent(chat_id))
+                await asyncio.sleep(2)
+        except Exception:
+            pass
+
+        await asyncio.sleep(600)  # every 10 min
+
 # ===============================
 # TAG MENTION HELPERS
 # ===============================
@@ -492,6 +542,26 @@ async def upsert_member_activity(chat_id: int, user_id: int):
           "ON CONFLICT(chat_id,user_id) DO UPDATE SET last_seen=EXCLUDED.last_seen",
           (chat_id, user_id, now)
         )
+
+async def upsert_member_batch(chat_id: int, user_ids: list[int], chunk_size: int = 50):
+    """
+    Safer than gathering 500 writes at once.
+    Prevents DB/SQLite spike while still being fast.
+    """
+    if not user_ids:
+        return
+
+    for i in range(0, len(user_ids), chunk_size):
+        chunk = user_ids[i:i + chunk_size]
+        results = await asyncio.gather(
+            *(upsert_member_activity(chat_id, u) for u in chunk),
+            return_exceptions=True
+        )
+        # swallow per-user errors safely
+        for r in results:
+            if isinstance(r, Exception):
+                pass
+        await asyncio.sleep(0)
 
 def build_emoji_mentions(user_ids: list[int]) -> str:
     # 7 per message, emoji text hides mention target
@@ -1332,6 +1402,13 @@ async def safe_send(func, *args, **kwargs):
                 old_chat_id = args[1]
                 new_chat_id = e.new_chat_id
 
+                if old_chat_id in BOT_ADMIN_CACHE:
+                    BOT_ADMIN_CACHE.discard(old_chat_id)
+                    BOT_ADMIN_CACHE.add(new_chat_id)
+
+                USER_ADMIN_CACHE[new_chat_id] = USER_ADMIN_CACHE.pop(old_chat_id, set())
+                REMINDER_MESSAGES[new_chat_id] = REMINDER_MESSAGES.pop(old_chat_id, [])
+
                 # -------- RAM migrate/clear (important for consistency) --------
                 # admin verify throttle: allow fresh checks on new id
                 ADMIN_VERIFY_CACHE.pop(old_chat_id, None)
@@ -1618,7 +1695,10 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_id = context.bot.id
 
     if (new.user.id == bot_id and new.status == "administrator" and old.status != "administrator"):
-        context.application.create_task(sync_and_notify_ready(chat.id, context))
+        context.application.create_task(collect_admins(chat.id, context))
+
+        # 🔥 NEW: instant warmup (fast collect mode)
+        context.application.create_task(fast_warmup_collect(chat.id, context))
 
         is_ok = getattr(new, "can_delete_messages", False)
         if is_ok:
@@ -1648,13 +1728,16 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
+        # fastest Bot-API backfill first
+        context.application.create_task(collect_admins(chat.id, context))
+
         try:
             await context.bot.send_message(
                 chat.id,
                 "✅ <b>Thank you!</b>\n\n"
                 "🤖 Bot ကို <b>Admin</b> အဖြစ် ခန့်ထားပြီးပါပြီး။\n\n"
                 "⏳ <b>Member list စုနေပါတယ်...</b>\n"
-                "ခဏစောင့်ပြီးမှ <b>/all /everyone /call</b> ကို သုံးပါ။",
+                "🗣️ အနည်းငယ်စကားပြောပြီးမှ <b>/all /everyone /call</b> ကို သုံးပါ။",
                 parse_mode="HTML"
             )
         except Exception:
@@ -1671,6 +1754,10 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         BOT_ADMIN_CACHE.discard(chat.id)
         clear_reminders(context, chat.id)
+
+        # collect whatever is available immediately via Bot API
+        context.application.create_task(collect_admins(chat.id, context))
+
         # ✅ Save non-admin group too (stay in group; no auto-leave)
         context.application.create_task(
             safe_db_execute(
@@ -1802,7 +1889,8 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             )
             # ✅ also collect current admins into member list
-            context.application.create_task(collect_admins(chat_id, context))        
+            context.application.create_task(collect_admins(chat_id, context))
+            context.application.create_task(sync_members_silent(chat_id))        
         else:
             await msg.reply_text(
                 "⚠️ <b>Bot မှာ Admin permission မရှိပါ</b>\n\n"
@@ -2055,7 +2143,7 @@ async def mention_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ids = []
     for a in admins:
         u = getattr(a, "user", None)
-        if not u or u.is_bot:
+        if not u:
             continue
         ids.append(int(u.id))
     ids = list(dict.fromkeys(ids))
@@ -2214,10 +2302,56 @@ async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if chat.type not in ("group", "supergroup"):
         return
-    if user.is_bot:
-        return
-    # record only real messages
+    
+    # 🔥 faster batch-safe insert
     await upsert_member_activity(chat.id, user.id)
+
+    # also capture service-message member payloads
+    try:
+        await maybe_collect_message_members(msg)
+    except Exception:
+        pass
+
+
+    # collect visible related users safely
+    try:
+        await maybe_collect_related_users(msg)
+    except Exception:
+        pass
+
+async def track_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    req = getattr(update, "chat_join_request", None)
+    if not req:
+        return
+
+    chat = getattr(req, "chat", None)
+    user = getattr(req, "from_user", None)
+    if not chat or not user:
+        return
+
+    try:
+        await upsert_member_activity(chat.id, user.id)
+    except Exception:
+        pass
+
+async def track_callback_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+
+    msg = q.message
+    user = q.from_user
+    if not msg or not user:
+        return
+
+    chat = getattr(msg, "chat", None)
+    if not chat or chat.type not in ("group", "supergroup"):
+        return
+
+    try:
+        await upsert_member_activity(chat.id, user.id)
+    except Exception:
+        pass
 
 # ===============================
 # MEMBER JOIN TRACK
@@ -2235,7 +2369,7 @@ async def track_member_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = new.user
-    if not user or user.is_bot:
+    if not user:
         return
 
     old_status = old.status
@@ -2244,6 +2378,13 @@ async def track_member_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if old_status in ("left", "kicked") and new_status in ("member", "administrator", "creator"):
         await upsert_member_activity(chat.id, user.id)
 
+        # If bot is already admin, keep list growing faster in background
+        try:
+            me = await context.bot.get_chat_member(chat.id, context.bot.id)
+            if me.status in ("administrator", "creator"):
+                context.application.create_task(sync_members_silent(chat.id))
+        except Exception:
+            pass
 # ===============================
 # MAIN
 # ===============================
@@ -2273,6 +2414,10 @@ def main():
     
     # Join event tracking
     app.add_handler(ChatMemberHandler(track_member_join, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatJoinRequestHandler(track_join_request))
+
+    # Track callback users in groups
+    app.add_handler(CallbackQueryHandler(track_callback_user), group=2)
 
     # Donate / Payments
     app.add_handler(CallbackQueryHandler(donate_callback, pattern=r"^donate"))
@@ -2306,24 +2451,6 @@ def main():
     async def on_startup(app):
         global pool
         print("🟡 Starting bot...", flush=True)
-    
-        global user_client
-
-        if TG_API_ID and TG_API_HASH and TG_SESSION:
-            from telethon import TelegramClient
-            from telethon.sessions import StringSession
-
-            user_client = TelegramClient(
-                StringSession(TG_SESSION),
-                TG_API_ID,
-                TG_API_HASH
-            )
-
-            await user_client.start()
-            print("✅ Userbot connected", flush=True)
-        else:
-            user_client = None
-            print("⚠️ Userbot disabled: missing TG_API_ID / TG_API_HASH / TG_SESSION", flush=True)
 
         await app.bot.delete_webhook(drop_pending_updates=True)
 
@@ -2372,10 +2499,16 @@ def main():
         rows = await safe_db_execute("SELECT group_id FROM groups", fetch=True) or []
         for r in rows:
             try:
-                await collect_admins(int(r["group_id"]), app)
+                gid = int(r["group_id"])
+                await collect_admins(gid, app)
+                if gid in BOT_ADMIN_CACHE:
+                    app.create_task(sync_members_silent(gid))
             except Exception:
                 pass
             await asyncio.sleep(0.1)
+
+        # 🔥 start background member sync loop
+        app.create_task(periodic_member_sync(app))
 
         print("🤖 LawSpeaker Tag Bot running (PRODUCTION READY)", flush=True)
     
