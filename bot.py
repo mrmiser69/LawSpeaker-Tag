@@ -49,13 +49,16 @@ DB_PORT = int(os.getenv("SUPABASE_PORT", "6543"))
 ADMIN_LIST_CACHE: dict[int, set[int]] = {}
 ADMIN_LIST_CACHE_TS: dict[int, int] = {}
 ADMIN_LIST_TTL = 60  # seconds (1 min)
+MAX_MEMBER_STORE = 1000        # per-group saved members max
+MAX_MENTION_PER_RUN = 1000     # max mentions per command run
+SYNC_LAST_RUN: dict[int, int] = {}
 
 # ===============================
 # TAG MENTION BOT (LOCKED RULES)
 # ===============================
 FALLBACK_DB_PATH = os.getenv("FALLBACK_DB_PATH", "/data/tagbot_cache.db")
 MENTION_COOLDOWN_SECONDS = 30
-ACTIVE_SECONDS = 300  # /call = last 5 minutes active
+ACTIVE_SECONDS = 1800  # /call = last 30 minutes active
 EMOJIS_PER_MESSAGE = 7
 
 # as big as you want (add more anytime)
@@ -158,7 +161,24 @@ async def maybe_collect_related_users(msg):
             pass
 
 async def sync_members_silent(chat_id: int):
-    return
+    """
+    Silent maintenance only:
+    - keep member store capped
+    - do not spam API
+    - do not send messages
+    """
+    try:
+        now = int(time.time())
+        last = SYNC_LAST_RUN.get(chat_id, 0)
+        if now - last < 60:   # 1 min cooldown
+            return
+        SYNC_LAST_RUN[chat_id] = now
+        await prune_member_store(chat_id)
+    except Exception:
+        pass
+
+async def start_periodic_member_sync(context: ContextTypes.DEFAULT_TYPE):
+    await periodic_member_sync(context.application)
 
 async def sync_and_notify_ready(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     if chat_id in SYNCING_CHATS:
@@ -489,7 +509,7 @@ async def periodic_member_sync(app):
     while True:
         try:
             for chat_id in list(BOT_ADMIN_CACHE):
-                app.create_task(sync_members_silent(chat_id))
+                await sync_members_silent(chat_id)
                 await asyncio.sleep(2)
         except Exception:
             pass
@@ -516,6 +536,42 @@ async def can_bot_work_for_mentions(chat_id: int, context: ContextTypes.DEFAULT_
         return me.status in ("administrator", "creator")
     except Exception:
         return False
+
+async def prune_member_store(chat_id: int):
+    """
+    Keep only newest MAX_MEMBER_STORE members per group.
+    Active/recent members stay, old inactive members get removed.
+    """
+    if DB_READY:
+        await safe_db_execute(
+            """
+            DELETE FROM members
+            WHERE chat_id=%s
+              AND user_id NOT IN (
+                SELECT user_id
+                FROM members
+                WHERE chat_id=%s
+                ORDER BY last_seen DESC
+                LIMIT %s
+              )
+            """,
+            (chat_id, chat_id, MAX_MEMBER_STORE)
+        )
+
+    await sqlite_execute(
+        """
+        DELETE FROM members
+        WHERE chat_id=?
+          AND user_id NOT IN (
+            SELECT user_id
+            FROM members
+            WHERE chat_id=?
+            ORDER BY last_seen DESC
+            LIMIT ?
+          )
+        """,
+        (chat_id, chat_id, MAX_MEMBER_STORE)
+    )
 
 async def upsert_member_activity(chat_id: int, user_id: int):
     now = int(time.time())
@@ -563,6 +619,12 @@ async def upsert_member_batch(chat_id: int, user_ids: list[int], chunk_size: int
                 pass
         await asyncio.sleep(0)
 
+    # 🔥 NEW: keep ONLY latest active 1000 (auto replace inactive)
+    try:
+        await prune_member_store(chat_id)
+    except Exception:
+        pass
+    
 def build_emoji_mentions(user_ids: list[int]) -> str:
     # 7 per message, emoji text hides mention target
     mentions = []
@@ -578,14 +640,14 @@ async def get_all_members(chat_id: int) -> list[int]:
     # Prefer Postgres if available; fallback SQLite always works
     if DB_READY:
         rows = await safe_db_execute(
-          "SELECT user_id FROM members WHERE chat_id=%s ORDER BY last_seen DESC",
-          (chat_id,), fetch=True
+          "SELECT user_id FROM members WHERE chat_id=%s ORDER BY last_seen DESC LIMIT %s",
+          (chat_id, MAX_MEMBER_STORE), fetch=True
         )
         if rows:
             return [int(r["user_id"]) for r in rows]
     rows2 = await sqlite_execute(
-      "SELECT user_id FROM members WHERE chat_id=? ORDER BY last_seen DESC",
-      (chat_id,), fetch=True
+      "SELECT user_id FROM members WHERE chat_id=? ORDER BY last_seen DESC LIMIT ?",
+      (chat_id, MAX_MEMBER_STORE), fetch=True
     ) or []
     return [int(r[0]) for r in rows2]
 
@@ -600,7 +662,7 @@ async def iter_all_members(chat_id: int, batch_size: int = 700):
             rows = await safe_db_execute(
                 "SELECT user_id FROM members WHERE chat_id=%s "
                 "ORDER BY last_seen DESC LIMIT %s OFFSET %s",
-                (chat_id, batch_size, offset),
+                (chat_id, min(batch_size, MAX_MEMBER_STORE), offset),
                 fetch=True
             )
             if not rows:
@@ -610,6 +672,8 @@ async def iter_all_members(chat_id: int, batch_size: int = 700):
                 if uid != 0:
                     yield uid
             offset += batch_size
+            if offset >= MAX_MEMBER_STORE:
+                break
         return
 
     offset = 0
@@ -617,7 +681,7 @@ async def iter_all_members(chat_id: int, batch_size: int = 700):
         rows = await sqlite_execute(
             "SELECT user_id FROM members WHERE chat_id=? "
             "ORDER BY last_seen DESC LIMIT ? OFFSET ?",
-            (chat_id, batch_size, offset),
+            (chat_id, min(batch_size, MAX_MEMBER_STORE), offset),
             fetch=True
         ) or []
         if not rows:
@@ -627,20 +691,22 @@ async def iter_all_members(chat_id: int, batch_size: int = 700):
             if uid != 0:
                 yield uid
         offset += batch_size
+        if offset >= MAX_MEMBER_STORE:
+            break
 
 async def get_active_members(chat_id: int) -> list[int]:
     now = int(time.time())
     cutoff = now - ACTIVE_SECONDS
     if DB_READY:
         rows = await safe_db_execute(
-          "SELECT user_id FROM members WHERE chat_id=%s AND last_seen >= %s ORDER BY last_seen DESC",
-          (chat_id, cutoff), fetch=True
+          "SELECT user_id FROM members WHERE chat_id=%s AND last_seen >= %s ORDER BY last_seen DESC LIMIT %s",
+          (chat_id, cutoff, MAX_MEMBER_STORE), fetch=True
         )
         if rows:
             return [int(r["user_id"]) for r in rows]
     rows2 = await sqlite_execute(
-      "SELECT user_id FROM members WHERE chat_id=? AND last_seen>=? ORDER BY last_seen DESC",
-      (chat_id, cutoff), fetch=True
+      "SELECT user_id FROM members WHERE chat_id=? AND last_seen>=? ORDER BY last_seen DESC LIMIT ?",
+      (chat_id, cutoff, MAX_MEMBER_STORE), fetch=True
     ) or []
     return [int(r[0]) for r in rows2]
 
@@ -694,22 +760,21 @@ async def ensure_bot_admin_live(chat_id: int, context: ContextTypes.DEFAULT_TYPE
 
         # -------- DB migrate --------
         # ✅ IMPORTANT: UPSERT new row + remove old row (avoid stale rows)
-        context.application.create_task(
-            safe_db_execute(
-                """
-                INSERT INTO groups (group_id, is_admin_cached, last_checked_at)
-                VALUES (%s, TRUE, %s)
-                ON CONFLICT (group_id)
-                DO UPDATE SET
-                  is_admin_cached = TRUE,
-                  last_checked_at = EXCLUDED.last_checked_at
-                """,
-                (new_id, now)
-            )
+        await safe_db_execute(
+            """
+            INSERT INTO groups (group_id, is_admin_cached, last_checked_at)
+            VALUES (%s, TRUE, %s)
+            ON CONFLICT (group_id)
+            DO UPDATE SET
+              is_admin_cached = TRUE,
+              last_checked_at = EXCLUDED.last_checked_at
+            """,
+            (new_id, now)
         )
         
-        context.application.create_task(
-            safe_db_execute("DELETE FROM groups WHERE group_id=%s", (chat_id,))
+        await safe_db_execute(
+            "DELETE FROM groups WHERE group_id=%s",
+            (chat_id,)
         )
         
         # retry with new chat_id
@@ -727,18 +792,16 @@ async def ensure_bot_admin_live(chat_id: int, context: ContextTypes.DEFAULT_TYPE
     if is_admin and can_delete:
         BOT_ADMIN_CACHE.add(chat_id)
         # ✅ keep DB in-sync (support-only) so broadcast/stats stay correct
-        context.application.create_task(
-            safe_db_execute(
-                """
-                INSERT INTO groups (group_id, is_admin_cached, last_checked_at)
-                VALUES (%s, TRUE, %s)
-                ON CONFLICT (group_id)
-                DO UPDATE SET
-                  is_admin_cached = TRUE,
-                  last_checked_at = EXCLUDED.last_checked_at
-                """,
-                (chat_id, now)
-            )
+        await safe_db_execute(
+            """
+            INSERT INTO groups (group_id, is_admin_cached, last_checked_at)
+            VALUES (%s, TRUE, %s)
+            ON CONFLICT (group_id)
+            DO UPDATE SET
+              is_admin_cached = TRUE,
+              last_checked_at = EXCLUDED.last_checked_at
+            """,
+            (chat_id, now)
         )
         return True
 
@@ -746,18 +809,16 @@ async def ensure_bot_admin_live(chat_id: int, context: ContextTypes.DEFAULT_TYPE
     USER_ADMIN_CACHE.pop(chat_id, None)
     REMINDER_MESSAGES.pop(chat_id, None)
 
-    context.application.create_task(
-        safe_db_execute(
-            """
-            INSERT INTO groups (group_id, is_admin_cached, last_checked_at)
-            VALUES (%s, FALSE, %s)
-            ON CONFLICT (group_id)
-            DO UPDATE SET
-              is_admin_cached = FALSE,
-              last_checked_at = EXCLUDED.last_checked_at
-            """,
-            (chat_id, now)
-        )
+    await safe_db_execute(
+        """
+        INSERT INTO groups (group_id, is_admin_cached, last_checked_at)
+        VALUES (%s, FALSE, %s)
+        ON CONFLICT (group_id)
+        DO UPDATE SET
+          is_admin_cached = FALSE,
+          last_checked_at = EXCLUDED.last_checked_at
+        """,
+        (chat_id, now)
     )
     return False
 
@@ -2160,7 +2221,8 @@ async def mention_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context,
         msg,
         iter_all_members(chat.id, batch_size=300),
-        text
+        text,
+        limit=MAX_MENTION_PER_RUN
     )
 
 async def mention_everyone(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2175,7 +2237,8 @@ async def mention_everyone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context,
         msg,
         iter_all_members(chat.id, batch_size=300),
-        text
+        text,
+        limit=MAX_MENTION_PER_RUN
     )
 
 async def mention_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2187,17 +2250,24 @@ async def mention_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = raw.replace("/call", "", 1).strip()
     ids = await get_active_members(chat.id)
     ids = [i for i in ids if i != context.bot.id]
+    ids = ids[:MAX_MENTION_PER_RUN]
     await _send_mentions_in_chunks(context, msg, ids, text)
 
-async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_iter, text: str):
+async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_iter, text: str, limit: int = MAX_MENTION_PER_RUN):
     chunk = []
     sent_any = False
     sent_count = 0
+    picked = 0
 
     async for uid in id_iter:
         if uid == context.bot.id:
             continue
+        
+        if picked >= limit:
+            break
+       
         chunk.append(uid)
+        picked += 1
 
         if len(chunk) == EMOJIS_PER_MESSAGE:
             line = build_emoji_mentions(chunk)
@@ -2214,13 +2284,15 @@ async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_i
                     chat_id=msg.chat_id,
                     text=((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
                 )
+
             sent_any = True
             sent_count += 1
             chunk = []
+
             if sent_count % 5 == 0:
                 await asyncio.sleep(1.2)
             else:
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.30)
 
     if chunk:
         line = build_emoji_mentions(chunk)
@@ -2234,11 +2306,15 @@ async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_i
                 reply_to_message_id=None
             )
         except Exception:
+            fallback_body = ((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
+            fallback_body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
+
             await context.bot.send_message(
                 chat_id=msg.chat_id,
-                text=((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
+                text=fallback_body
             )
         sent_any = True
+
     elif sent_any:
         try:
             await context.bot.send_message(
@@ -2254,6 +2330,8 @@ async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_i
         )
 
 async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user_ids: list[int], text: str):
+    user_ids = user_ids[:MAX_MENTION_PER_RUN]
+
     # empty list guard
     if not user_ids:
         await context.bot.send_message(
@@ -2284,15 +2362,21 @@ async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user
            )
         except Exception:
             # fallback plain text (mentions might not work)
+            fallback_body = ((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
+
+            # ✅ IMPORTANT: add footer on last chunk
+            if is_last_chunk:
+                fallback_body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
+
             await context.bot.send_message(
                 chat_id=msg.chat_id,
-                text=((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
+                text=fallback_body
             )
         sent_count += 1
         if sent_count % 5 == 0:
             await asyncio.sleep(1.2)
         else:
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.30)
 
 async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -2382,7 +2466,7 @@ async def track_member_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             me = await context.bot.get_chat_member(chat.id, context.bot.id)
             if me.status in ("administrator", "creator"):
-                context.application.create_task(sync_members_silent(chat.id))
+                await sync_members_silent(chat.id)
         except Exception:
             pass
 # ===============================
@@ -2502,13 +2586,14 @@ def main():
                 gid = int(r["group_id"])
                 await collect_admins(gid, app)
                 if gid in BOT_ADMIN_CACHE:
-                    app.create_task(sync_members_silent(gid))
+                    await sync_members_silent(gid)
             except Exception:
                 pass
             await asyncio.sleep(0.1)
 
-        # 🔥 start background member sync loop
-        app.create_task(periodic_member_sync(app))
+        # 🔥 start background member sync loop AFTER app is fully running
+        if app.job_queue:
+            app.job_queue.run_once(start_periodic_member_sync, when=1)
 
         print("🤖 LawSpeaker Tag Bot running (PRODUCTION READY)", flush=True)
     
