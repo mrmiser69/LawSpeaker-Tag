@@ -1796,9 +1796,10 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat.id,
                 "✅ <b>Thank you!</b>\n\n"
-                "🤖 Bot ကို <b>Admin</b> အဖြစ် ခန့်ထားပြီးပါပြီး။\n\n"
-                "⏳ <b>Member list စုနေပါတယ်...</b>\n"
-                "🗣️ အနည်းငယ်စကားပြောပြီးမှ <b>/all /everyone /call</b> ကို သုံးပါ။",
+                "🤖 <b>Bot</b> ကို <b>Admin</b> အဖြစ် ခန့်ထားပြီးပါပြီး။\n\n"
+                "⏳ <b>Member list စုနေပါတယ်.....။</b>\n"
+                "🗣️ <b>အနည်းငယ်စကားပြောပြီးမှ</b>\n"
+                "<b>/all /everyone /call /admins ကို သုံးပါ။</b>",
                 parse_mode="HTML"
             )
         except Exception:
