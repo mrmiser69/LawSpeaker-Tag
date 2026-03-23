@@ -2044,26 +2044,25 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if (new.user.id == bot_id and new.status == "member" and old.status in ("left", "kicked")):
         context.application.create_task(sync_members_silent(chat.id))
                 
-        # ✅ USERBOT bootstrap (bot member ဖြစ်လည်း run)
+    # ✅ BOT ADDED AS MEMBER (NOT ADMIN) → STILL RUN USERBOT
+    if (new.user.id == bot_id and new.status == "member" and old.status in ("left", "kicked")):
+        BOT_ADMIN_CACHE.discard(chat.id)
+        clear_reminders(context, chat.id)
+
+        # bot-side fallback sync
+        context.application.create_task(sync_members_silent(chat.id))
+
+        # collect whatever is visible immediately via Bot API
+        context.application.create_task(collect_admins(chat.id, context))
+
+        # 🔥 userbot bootstrap (only once)
         if chat.id not in USERBOT_SYNC_DONE and context.job_queue:
             context.job_queue.run_once(
                 lambda ctx: ctx.application.create_task(trigger_userbot_bootstrap(chat.id, ctx)),
                 when=2
             )
 
-        BOT_ADMIN_CACHE.discard(chat.id)
-        clear_reminders(context, chat.id)
-
-        # collect whatever is available immediately via Bot API
-        context.application.create_task(collect_admins(chat.id, context))
-
-        # 🔥 IMPORTANT: trigger userbot even if NOT admin
-        context.job_queue.run_once(
-            lambda ctx: ctx.application.create_task(trigger_userbot_bootstrap(chat.id, ctx)),
-            when=2
-        )
-
-        # ✅ Save non-admin group too (stay in group; no auto-leave)
+        # save non-admin group too
         context.application.create_task(
             safe_db_execute(
                 """
@@ -2076,7 +2075,9 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 """,
                 (chat.id, int(time.time()))
             )
-        )        
+        )
+
+        # optional admin reminder
         try:
             me = await context.bot.get_me()
             keyboard = InlineKeyboardMarkup([[
@@ -2103,6 +2104,8 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
         except:
             pass
+
+        return
 
 async def admin_reminder(context: ContextTypes.DEFAULT_TYPE):
     if not context.job or not context.job.data:
