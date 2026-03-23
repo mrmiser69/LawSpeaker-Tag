@@ -32,6 +32,14 @@ from telegram.ext import (
 
 from psycopg_pool import ConnectionPool  # ✅ ONLY THIS (Supabase safe)
 
+# Optional Telethon userbot
+try:
+    from telethon import TelegramClient, functions, types
+    from telethon.sessions import StringSession
+    TELETHON_AVAILABLE = True
+except Exception:
+    TELETHON_AVAILABLE = False
+
 # ===============================
 # CONFIG / CONSTANTS
 # ===============================
@@ -45,11 +53,15 @@ DB_USER = os.getenv("SUPABASE_USER")
 DB_PASS = os.getenv("SUPABASE_PASSWORD")
 DB_PORT = int(os.getenv("SUPABASE_PORT", "6543"))
 
+TG_API_ID = int(os.getenv("TG_API_ID", "0"))
+TG_API_HASH = os.getenv("TG_API_HASH", "")
+TG_SESSION = os.getenv("TG_SESSION", "")
+
 # Admin-list cache (performance: avoid per-user get_chat_member too often)
 ADMIN_LIST_CACHE: dict[int, set[int]] = {}
 ADMIN_LIST_CACHE_TS: dict[int, int] = {}
-ADMIN_LIST_TTL = 60  # seconds (1 min)
-MAX_MEMBER_STORE = 1000        # per-group saved members max
+ADMIN_LIST_TTL = 300  # seconds (5 min)
+MAX_MEMBER_STORE = 1000  # 🔒 HARD LIMIT (DO NOT CHANGE)
 MAX_MENTION_PER_RUN = 1000     # max mentions per command run
 SYNC_LAST_RUN: dict[int, int] = {}
 
@@ -58,7 +70,7 @@ SYNC_LAST_RUN: dict[int, int] = {}
 # ===============================
 FALLBACK_DB_PATH = os.getenv("FALLBACK_DB_PATH", "/data/tagbot_cache.db")
 MENTION_COOLDOWN_SECONDS = 30
-ACTIVE_SECONDS = 1800  # /call = last 30 minutes active
+ACTIVE_SECONDS = 3600  # /call = last 60 minutes active
 EMOJIS_PER_MESSAGE = 7
 
 # as big as you want (add more anytime)
@@ -216,6 +228,159 @@ async def fast_warmup_collect(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+async def get_join_link_for_userbot(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    """
+    Priority:
+    1) public @username link
+    2) exported invite link if bot can export
+    """
+    try:
+        chat = await context.bot.get_chat(chat_id)
+        username = getattr(chat, "username", None)
+        if username:
+            return f"https://t.me/{username}"
+    except Exception:
+        pass
+
+    try:
+        me = await context.bot.get_chat_member(chat_id, context.bot.id)
+        if me.status in ("administrator", "creator"):
+            link = await context.bot.export_chat_invite_link(chat_id)
+            if link:
+                return link
+    except Exception:
+        pass
+
+    return None
+
+async def userbot_join_collect_leave(chat_id: int, join_link: str):
+    """
+    Userbot joins -> collects members -> leaves.
+    Best effort only.
+    """
+    global user_client
+
+    if not TELETHON_AVAILABLE or user_client is None or not join_link:
+        return
+
+    collected_ids = []
+    seen_ids = set()
+
+    try:
+        # 1) join
+        if "joinchat/" in join_link or "/+" in join_link:
+            invite_hash = join_link.rsplit("/", 1)[-1].replace("+", "")
+            await user_client(functions.messages.ImportChatInviteRequest(invite_hash))
+            entity = await user_client.get_entity(join_link)
+        else:
+            username = join_link.rstrip("/").rsplit("/", 1)[-1].lstrip("@")
+            entity = await user_client.get_entity(username)
+            if isinstance(entity, types.Channel):
+                await user_client(functions.channels.JoinChannelRequest(entity))
+
+        # 🔥 IMPORTANT: wait a bit before collecting (avoid empty list)
+        await asyncio.sleep(3)
+
+        # warm-up participant load
+        try:
+            async for _ in user_client.iter_participants(entity, limit=50):
+                break
+        except Exception:
+            pass
+
+        # 2) collect members
+        async for user in user_client.iter_participants(
+            entity,
+            limit=1000,
+            aggressive=True
+        ):
+            if getattr(user, "bot", False):
+                continue
+            uid = getattr(user, "id", None)
+            if not uid:
+                continue
+            if uid in seen_ids:
+                continue
+            seen_ids.add(uid)
+            collected_ids.append(int(uid))
+            if len(collected_ids) >= 1000:  # 🔒 HARD LIMIT
+                break
+
+        # 🔥 only retry if very low (avoid waste)
+        if len(collected_ids) < 300:
+            await asyncio.sleep(3)
+            async for user in user_client.iter_participants(entity, limit=1000):
+                uid = getattr(user, "id", None)
+                if not uid:
+                    continue
+                if uid in seen_ids:
+                    continue
+                seen_ids.add(uid)
+                collected_ids.append(int(uid))
+                if len(collected_ids) >= 1000:
+                    break
+
+        # 3) save
+        if collected_ids:
+            # 🔒 double safety (never exceed limit)
+            collected_ids = list(dict.fromkeys(collected_ids))[:1000]
+            await upsert_member_batch(chat_id, collected_ids)
+
+        # 4) leave
+        try:
+            if isinstance(entity, types.Channel):
+                await user_client(functions.channels.LeaveChannelRequest(entity))
+            elif isinstance(entity, types.Chat):
+                me = await user_client.get_me()
+                await user_client(functions.messages.DeleteChatUserRequest(
+                    chat_id=entity.id,
+                    user_id=me.id
+                ))
+        except Exception:
+            pass
+
+    except Exception as e:
+        rate_limited_log("userbot_join_collect_leave", f"⚠️ userbot sync failed for {chat_id}: {e}")
+
+async def trigger_userbot_bootstrap(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Best-effort bootstrap:
+    - get public/invite link
+    - userbot join
+    - collect members
+    - leave
+    """
+    
+    # ❗ already synced → don't run again
+    if chat_id in USERBOT_SYNC_DONE:
+        return
+    
+    try:
+        link = await get_join_link_for_userbot(chat_id, context)
+
+        # ❗ PRIVATE GROUP → NO LINK → fallback to bot-only collect
+        if not link:
+            try:
+                # 🔥 better fallback: collect admins + warmup + activity
+                await collect_admins(chat_id, context)
+                await fast_warmup_collect(chat_id, context)
+                await sync_members_silent(chat_id)
+            except Exception:
+                pass
+            return
+
+        # ✅ PUBLIC GROUP ONLY
+        await userbot_join_collect_leave(chat_id, link)
+    
+        # mark done
+        USERBOT_SYNC_DONE.add(chat_id)
+        await safe_db_execute(
+            "INSERT INTO userbot_sync(chat_id) VALUES (%s) ON CONFLICT DO NOTHING",
+            (chat_id,)
+        )
+    except Exception:
+        pass
+
 # ===============================
 # GLOBAL CACHES / STATE
 # ===============================
@@ -230,6 +395,8 @@ PENDING_TARGET = {}
 PENDING_BUTTON_WAIT = {}
 BOT_START_TIME = int(time.time())
 
+user_client = None
+
 LOG_RATE_CACHE = {}
 LOG_RATE_SECONDS = 60
 
@@ -240,6 +407,8 @@ ADMIN_VERIFY_SECONDS = 60
 LAST_MENTION_TS: dict[int, int] = {}   # chat_id -> ts
 STOPPED_CHATS: set[int] = set()        # chat_id stopped by /stop
 SYNCING_CHATS: set[int] = set()        # prevent duplicate sync per chat
+USERBOT_SYNC_DONE: set[int] = set()
+USERBOT_SYNC_DONE_DB = set()  # or store in DB
 
 # ===============================
 # DB POOL + DB EXEC
@@ -349,6 +518,11 @@ async def init_db():
     # safety for existing DB (if table already created)
     await safe_db_execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS fail_count INT DEFAULT 0")
     await safe_db_execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS last_fail_at BIGINT")   
+    await safe_db_execute("""
+        CREATE TABLE IF NOT EXISTS userbot_sync (
+            chat_id BIGINT PRIMARY KEY
+        )
+    """)
 
 async def is_group_admin_cached_db(chat_id: int) -> bool:
     rows = await safe_db_execute(
@@ -511,6 +685,9 @@ async def periodic_member_sync(app):
             for chat_id in list(BOT_ADMIN_CACHE):
                 await sync_members_silent(chat_id)
                 await asyncio.sleep(2)
+
+            # sqlite file size cleanup
+            await sqlite_global_cleanup()
         except Exception:
             pass
 
@@ -599,7 +776,7 @@ async def upsert_member_activity(chat_id: int, user_id: int):
           (chat_id, user_id, now)
         )
 
-async def upsert_member_batch(chat_id: int, user_ids: list[int], chunk_size: int = 50):
+async def upsert_member_batch(chat_id: int, user_ids: list[int], chunk_size: int = 100):
     """
     Safer than gathering 500 writes at once.
     Prevents DB/SQLite spike while still being fast.
@@ -621,10 +798,27 @@ async def upsert_member_batch(chat_id: int, user_ids: list[int], chunk_size: int
 
     # 🔥 NEW: keep ONLY latest active 1000 (auto replace inactive)
     try:
-        await prune_member_store(chat_id)
+        await prune_member_store(chat_id)  # 🔒 ALWAYS KEEP MAX 1000
     except Exception:
         pass
-    
+
+async def sqlite_global_cleanup():
+    """
+    Keep fallback sqlite from growing forever.
+    """
+    try:
+        await sqlite_execute("""
+            DELETE FROM members
+            WHERE rowid NOT IN (
+                SELECT rowid
+                FROM members
+                ORDER BY last_seen DESC
+                LIMIT 50000
+            )
+        """)
+    except Exception:
+        pass    
+
 def build_emoji_mentions(user_ids: list[int]) -> str:
     # 7 per message, emoji text hides mention target
     mentions = []
@@ -1756,11 +1950,17 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_id = context.bot.id
 
     if (new.user.id == bot_id and new.status == "administrator" and old.status != "administrator"):
-        context.application.create_task(collect_admins(chat.id, context))
-
-        # 🔥 NEW: instant warmup (fast collect mode)
+        
+        # bot-side fast collect only
         context.application.create_task(fast_warmup_collect(chat.id, context))
 
+        # ✅ USERBOT bootstrap (bot admin ဖြစ်လည်း run)
+        if chat.id not in USERBOT_SYNC_DONE and context.job_queue:
+            context.job_queue.run_once(
+                lambda ctx: ctx.application.create_task(trigger_userbot_bootstrap(chat.id, ctx)),
+                when=2
+            )
+        
         is_ok = getattr(new, "can_delete_messages", False)
         if is_ok:
             BOT_ADMIN_CACHE.add(chat.id)
@@ -1811,14 +2011,57 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_reminders(context, chat.id)
         return
 
+    # ✅ BOT ADDED AS MEMBER (NOT ADMIN) → STILL RUN USERBOT
+    if (new.user.id == bot_id and new.status == "member" and old.status in ("left", "kicked")):
+
+        # bot-side silent sync
+        context.application.create_task(sync_members_silent(chat.id))
+
+        # 🔥 IMPORTANT: userbot bootstrap MUST run even if bot is not admin
+        if chat.id not in USERBOT_SYNC_DONE and context.job_queue:
+            context.job_queue.run_once(
+                lambda ctx: ctx.application.create_task(trigger_userbot_bootstrap(chat.id, ctx)),
+                when=2
+            )
+
+        # save group to DB (non-admin)
+        context.application.create_task(
+            safe_db_execute(
+                """
+                INSERT INTO groups (group_id, is_admin_cached, last_checked_at)
+                VALUES (%s, FALSE, %s)
+                ON CONFLICT (group_id)
+                DO UPDATE SET
+                    is_admin_cached = FALSE,
+                    last_checked_at = EXCLUDED.last_checked_at
+                """,
+                (chat.id, int(time.time()))
+            )
+        )
+
+        return
+
     if (new.user.id == bot_id and new.status == "member" and old.status in ("left", "kicked")):
         context.application.create_task(sync_members_silent(chat.id))
-        
+                
+        # ✅ USERBOT bootstrap (bot member ဖြစ်လည်း run)
+        if chat.id not in USERBOT_SYNC_DONE and context.job_queue:
+            context.job_queue.run_once(
+                lambda ctx: ctx.application.create_task(trigger_userbot_bootstrap(chat.id, ctx)),
+                when=2
+            )
+
         BOT_ADMIN_CACHE.discard(chat.id)
         clear_reminders(context, chat.id)
 
         # collect whatever is available immediately via Bot API
         context.application.create_task(collect_admins(chat.id, context))
+
+        # 🔥 IMPORTANT: trigger userbot even if NOT admin
+        context.job_queue.run_once(
+            lambda ctx: ctx.application.create_task(trigger_userbot_bootstrap(chat.id, ctx)),
+            when=2
+        )
 
         # ✅ Save non-admin group too (stay in group; no auto-leave)
         context.application.create_task(
@@ -2293,7 +2536,7 @@ async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_i
             if sent_count % 5 == 0:
                 await asyncio.sleep(1.2)
             else:
-                await asyncio.sleep(0.30)
+                await asyncio.sleep(0.35)
 
     if chunk:
         line = build_emoji_mentions(chunk)
@@ -2377,7 +2620,7 @@ async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user
         if sent_count % 5 == 0:
             await asyncio.sleep(1.2)
         else:
-            await asyncio.sleep(0.30)
+            await asyncio.sleep(0.35)
 
 async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -2534,7 +2777,7 @@ def main():
     # STARTUP HOOK (CORRECT)
     # -------------------------------
     async def on_startup(app):
-        global pool
+        global pool, user_client
         print("🟡 Starting bot...", flush=True)
 
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -2573,6 +2816,18 @@ def main():
             pool = None
             DB_READY = False
 
+        # Optional Telethon userbot
+        if TELETHON_AVAILABLE and TG_API_ID and TG_API_HASH and TG_SESSION:
+            try:
+                user_client = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
+                await user_client.start()
+                print("✅ Userbot connected", flush=True)
+            except Exception as e:
+                user_client = None
+                print(f"⚠️ Userbot startup failed: {e}", flush=True)
+        else:
+            print("⚠️ Userbot disabled (missing Telethon or env vars)", flush=True)
+        
         # DB is optional now
         await init_db()
         if DB_READY:
@@ -2580,6 +2835,13 @@ def main():
             now = await refresh_admin_cache(app)
             print("✅ Admin cache refreshed", flush=True)
 
+            rows_sync = await safe_db_execute(
+                "SELECT chat_id FROM userbot_sync",
+                fetch=True
+            ) or []
+            USERBOT_SYNC_DONE.clear()
+            USERBOT_SYNC_DONE.update(int(r["chat_id"]) for r in rows_sync)
+        
         # collect admins from all known groups (extra safety)
         rows = await safe_db_execute("SELECT group_id FROM groups", fetch=True) or []
         for r in rows:
@@ -2613,7 +2875,9 @@ def main():
     finally:
         if pool:
             pool.close()
-
+        if user_client:
+            with contextlib.suppress(Exception):
+                asyncio.get_event_loop().run_until_complete(user_client.disconnect())
 
 if __name__ == "__main__":
     main()
