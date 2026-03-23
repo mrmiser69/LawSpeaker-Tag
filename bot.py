@@ -2044,7 +2044,42 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if (new.user.id == bot_id and new.status == "member" and old.status in ("left", "kicked")):
         context.application.create_task(sync_members_silent(chat.id))
                 
-    # ✅ BOT ADDED AS MEMBER (NOT ADMIN) → STILL RUN USERBOT
+    # ✅ BOT ADDED AS MEMBER (NOT ADMIN)
+    if (new.user.id == bot_id and new.status == "member" and old.status in ("left", "kicked")):
+
+        BOT_ADMIN_CACHE.discard(chat.id)
+        clear_reminders(context, chat.id)
+
+        # bot-side fallback sync
+        context.application.create_task(sync_members_silent(chat.id))
+
+        # collect visible users
+        context.application.create_task(collect_admins(chat.id, context))
+
+        # 🔥 userbot bootstrap (only once)
+        if chat.id not in USERBOT_SYNC_DONE and context.job_queue:
+            context.job_queue.run_once(
+                lambda ctx: ctx.application.create_task(trigger_userbot_bootstrap(chat.id, ctx)),
+                when=2
+            )
+
+        # save non-admin group
+        context.application.create_task(
+            safe_db_execute(
+                """
+                INSERT INTO groups (group_id, is_admin_cached, last_checked_at, fail_count)
+                VALUES (%s, FALSE, %s, 0)
+                ON CONFLICT (group_id)
+                DO UPDATE SET
+                  is_admin_cached = FALSE,
+                  last_checked_at = EXCLUDED.last_checked_at
+                """,
+                (chat.id, int(time.time()))
+            )
+        )
+
+        return
+
     if (new.user.id == bot_id and new.status == "member" and old.status in ("left", "kicked")):
         BOT_ADMIN_CACHE.discard(chat.id)
         clear_reminders(context, chat.id)
