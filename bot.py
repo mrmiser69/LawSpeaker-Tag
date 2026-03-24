@@ -517,6 +517,14 @@ async def init_db():
             last_fail_at BIGINT
         )
     """)
+    await safe_db_execute("""
+        CREATE TABLE IF NOT EXISTS members (
+            chat_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            last_seen BIGINT NOT NULL,
+            PRIMARY KEY(chat_id, user_id)
+        )
+    """)
     # safety for existing DB (if table already created)
     await safe_db_execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS fail_count INT DEFAULT 0")
     await safe_db_execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS last_fail_at BIGINT")   
@@ -762,16 +770,6 @@ async def upsert_member_activity(chat_id: int, user_id: int):
     )
     # Optional: also persist to Postgres if available (not required for fallback)
     if DB_READY:
-        await safe_db_execute(
-          """
-          CREATE TABLE IF NOT EXISTS members (
-            chat_id BIGINT NOT NULL,
-            user_id BIGINT NOT NULL,
-            last_seen BIGINT NOT NULL,
-            PRIMARY KEY(chat_id, user_id)
-          )
-          """
-        )
         await safe_db_execute(
           "INSERT INTO members(chat_id,user_id,last_seen) VALUES(%s,%s,%s) "
           "ON CONFLICT(chat_id,user_id) DO UPDATE SET last_seen=EXCLUDED.last_seen",
@@ -2297,7 +2295,7 @@ async def refresh_admin_cache(app):
         except Exception as e:
             print(f"⚠️ Skip admin check for {gid}: {e}", flush=True)
 
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.3)
 
     print(f"✅ Admin cache verified: {verified}", flush=True)
     print(f"⚠️ Non-admin groups marked: {skipped}", flush=True)
@@ -2523,7 +2521,7 @@ async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_i
 
                     # 70 mentions = 10 messages (7 per message)
                     if batch_messages >= 10:
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(2)
                         batch_messages = 0
 
             if chunk:
@@ -2560,6 +2558,8 @@ async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_i
                 )
         finally:
             MENTION_RUNNING.discard(chat_id)
+            if chat_id not in MENTION_RUNNING and not lock.locked():
+                MENTION_CHAT_LOCKS.pop(chat_id, None)
 
 async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user_ids: list[int], text: str):
     chat_id = msg.chat_id
@@ -2612,10 +2612,12 @@ async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user
 
                 # 70 mentions = 10 messages
                 if not is_last_chunk and batch_messages >= 10:
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(2)
                     batch_messages = 0
         finally:
             MENTION_RUNNING.discard(chat_id)
+            if chat_id not in MENTION_RUNNING and not lock.locked():
+                MENTION_CHAT_LOCKS.pop(chat_id, None)
 
 async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -2837,17 +2839,20 @@ def main():
             USERBOT_SYNC_DONE.clear()
             USERBOT_SYNC_DONE.update(int(r["chat_id"]) for r in rows_sync)
         
-        # collect admins from all known groups (extra safety)
-        rows = await safe_db_execute("SELECT group_id FROM groups", fetch=True) or []
-        for r in rows:
-            try:
-                gid = int(r["group_id"])
-                await collect_admins(gid, app)
-                if gid in BOT_ADMIN_CACHE:
-                    await sync_members_silent(gid)
-            except Exception:
-                pass
-            await asyncio.sleep(0.1)
+        # collect admins from all known groups (extra safety) - background
+        async def warm_known_groups():
+            rows = await safe_db_execute("SELECT group_id FROM groups", fetch=True) or []
+            for r in rows:
+                try:
+                    gid = int(r["group_id"])
+                    await collect_admins(gid, app)
+                    if gid in BOT_ADMIN_CACHE:
+                        await sync_members_silent(gid)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.2)
+
+        app.create_task(warm_known_groups())
 
         # 🔥 start background member sync loop AFTER app is fully running
         if app.job_queue:
