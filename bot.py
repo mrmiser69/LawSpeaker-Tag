@@ -409,6 +409,8 @@ STOPPED_CHATS: set[int] = set()        # chat_id stopped by /stop
 SYNCING_CHATS: set[int] = set()        # prevent duplicate sync per chat
 USERBOT_SYNC_DONE: set[int] = set()
 USERBOT_SYNC_DONE_DB = set()  # or store in DB
+MENTION_RUNNING: set[int] = set()      # prevent overlapping mention in same group
+MENTION_CHAT_LOCKS: dict[int, asyncio.Lock] = {}  # per-group mention lock
 
 # ===============================
 # DB POOL + DB EXEC
@@ -2406,6 +2408,11 @@ async def _mention_common_guard(update: Update, context: ContextTypes.DEFAULT_TY
         wait = MENTION_COOLDOWN_SECONDS - (now - last)
         await msg.reply_text(f"⏳ Cooldown... ({wait}s) နောက်မှထပ်သုံးပါ။")
         return False, ""
+
+    if chat.id in MENTION_RUNNING:
+        await msg.reply_text("⏳ Mention ခေါ်နေတာရှိသေးတယ်။ ခဏစောင့်ပြီးမှ ထပ်ခေါ်ပါ။")
+        return False, ""
+
     LAST_MENTION_TS[chat.id] = now
     # if stopped, auto-resume by using /all /admins /call (no resume message)
     if chat.id in STOPPED_CHATS:
@@ -2474,129 +2481,141 @@ async def mention_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_mentions_in_chunks(context, msg, ids, text)
 
 async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_iter, text: str, limit: int = MAX_MENTION_PER_RUN):
-    chunk = []
-    sent_any = False
-    sent_count = 0
-    picked = 0
+    chat_id = msg.chat_id
+    lock = MENTION_CHAT_LOCKS.setdefault(chat_id, asyncio.Lock())
 
-    async for uid in id_iter:
-        if uid == context.bot.id:
-            continue
-        
-        if picked >= limit:
-            break
-       
-        chunk.append(uid)
-        picked += 1
-
-        if len(chunk) == EMOJIS_PER_MESSAGE:
-            line = build_emoji_mentions(chunk)
-            body = f"{escape(text)}\n\n{line}" if text else line
-            try:
-                await context.bot.send_message(
-                    chat_id=msg.chat_id,
-                    text=body,
-                    parse_mode="HTML",
-                    reply_to_message_id=None
-                )
-            except Exception:
-                await context.bot.send_message(
-                    chat_id=msg.chat_id,
-                    text=((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
-                )
-
-            sent_any = True
-            sent_count += 1
+    async with lock:
+        MENTION_RUNNING.add(chat_id)
+        try:
             chunk = []
+            picked = 0
+            sent_any = False
+            batch_messages = 0
 
-            if sent_count % 5 == 0:
-                await asyncio.sleep(1.2)
+            async for uid in id_iter:
+                if uid == context.bot.id:
+                    continue
+                if picked >= limit:
+                    break
+
+                chunk.append(uid)
+                picked += 1
+
+                if len(chunk) == EMOJIS_PER_MESSAGE:
+                    line = build_emoji_mentions(chunk)
+                    body = f"{escape(text)}\n\n{line}" if text else line
+                    try:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=body,
+                            parse_mode="HTML",
+                            reply_to_message_id=None
+                        )
+                    except Exception:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
+                        )
+
+                    sent_any = True
+                    batch_messages += 1
+                    chunk = []
+
+                    # 70 mentions = 10 messages (7 per message)
+                    if batch_messages >= 10:
+                        await asyncio.sleep(3)
+                        batch_messages = 0
+
+            if chunk:
+                line = build_emoji_mentions(chunk)
+                body = f"{escape(text)}\n\n{line}" if text else line
+                body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=body,
+                        parse_mode="HTML",
+                        reply_to_message_id=None
+                    )
+                except Exception:
+                    fallback_body = ((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
+                    fallback_body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=fallback_body
+                    )
+                sent_any = True
+            elif sent_any:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="ခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
+                    )
+                except Exception:
+                    pass
             else:
-                await asyncio.sleep(0.35)
-
-    if chunk:
-        line = build_emoji_mentions(chunk)
-        body = f"{escape(text)}\n\n{line}" if text else line
-        body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
-        try:
-            await context.bot.send_message(
-                chat_id=msg.chat_id,
-                text=body,
-                parse_mode="HTML",
-                reply_to_message_id=None
-            )
-        except Exception:
-            fallback_body = ((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
-            fallback_body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
-
-            await context.bot.send_message(
-                chat_id=msg.chat_id,
-                text=fallback_body
-            )
-        sent_any = True
-
-    elif sent_any:
-        try:
-            await context.bot.send_message(
-                chat_id=msg.chat_id,
-                text="ခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
-            )
-        except Exception:
-            pass
-    else:
-        await context.bot.send_message(
-            chat_id=msg.chat_id,
-            text="⚠️ Member list မရှိသေးပါ။ (အနည်းငယ် message တွေပြောပြီးမှ Mention လုပ်ပါ)"
-        )
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ Member list မရှိသေးပါ။ (အနည်းငယ် message တွေပြောပြီးမှ Mention လုပ်ပါ)"
+                )
+        finally:
+            MENTION_RUNNING.discard(chat_id)
 
 async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user_ids: list[int], text: str):
-    user_ids = user_ids[:MAX_MENTION_PER_RUN]
+    chat_id = msg.chat_id
+    lock = MENTION_CHAT_LOCKS.setdefault(chat_id, asyncio.Lock())
 
-    # empty list guard
-    if not user_ids:
-        await context.bot.send_message(
-            chat_id=msg.chat_id,
-            text="⚠️ Member list မရှိသေးပါ။ (အနည်းငယ် message တွေပြောပြီးမှ Mention လုပ်ပါ)"
-        )
-        return
-    # chunk 7 each message
-    sent_count = 0
-    for i in range(0, len(user_ids), EMOJIS_PER_MESSAGE):
-        chunk = user_ids[i:i+EMOJIS_PER_MESSAGE]
-        line = build_emoji_mentions(chunk)
-        is_last_chunk = (i + EMOJIS_PER_MESSAGE) >= len(user_ids)
-        if text:
-            body = f"{escape(text)}\n\n{line}"
-        else:
-            body = f"{line}"
-        
-        # ✅ Add footer only on LAST mention message
-        if is_last_chunk:
-            body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
+    async with lock:
+        MENTION_RUNNING.add(chat_id)
         try:
-            await context.bot.send_message(
-               chat_id=msg.chat_id,
-               text=body,
-               parse_mode="HTML",
-               reply_to_message_id=None
-           )
-        except Exception:
-            # fallback plain text (mentions might not work)
-            fallback_body = ((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
+            user_ids = user_ids[:MAX_MENTION_PER_RUN]
 
-            # ✅ IMPORTANT: add footer on last chunk
-            if is_last_chunk:
-                fallback_body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
+            if not user_ids:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ Member list မရှိသေးပါ။ (အနည်းငယ် message တွေပြောပြီးမှ Mention လုပ်ပါ)"
+                )
+                return
 
-            await context.bot.send_message(
-                chat_id=msg.chat_id,
-                text=fallback_body
-            )
-        sent_count += 1
-        if sent_count % 5 == 0:
-            await asyncio.sleep(1.2)
-        else:
-            await asyncio.sleep(0.35)
+            batch_messages = 0
+
+            for i in range(0, len(user_ids), EMOJIS_PER_MESSAGE):
+                chunk = user_ids[i:i+EMOJIS_PER_MESSAGE]
+                line = build_emoji_mentions(chunk)
+                is_last_chunk = (i + EMOJIS_PER_MESSAGE) >= len(user_ids)
+
+                if text:
+                    body = f"{escape(text)}\n\n{line}"
+                else:
+                    body = f"{line}"
+
+                if is_last_chunk:
+                    body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
+
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=body,
+                        parse_mode="HTML",
+                        reply_to_message_id=None
+                    )
+                except Exception:
+                    fallback_body = ((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
+                    if is_last_chunk:
+                        fallback_body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=fallback_body
+                    )
+
+                batch_messages += 1
+
+                # 70 mentions = 10 messages
+                if not is_last_chunk and batch_messages >= 10:
+                    await asyncio.sleep(3)
+                    batch_messages = 0
+        finally:
+            MENTION_RUNNING.discard(chat_id)
 
 async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
