@@ -68,7 +68,7 @@ SYNC_LAST_RUN: dict[int, int] = {}
 # ===============================
 # TAG MENTION BOT (LOCKED RULES)
 # ===============================
-FALLBACK_DB_PATH = os.getenv("FALLBACK_DB_PATH", "/data/tagbot_cache.db")
+FALLBACK_DB_PATH = os.getenv("FALLBACK_DB_PATH", "/app/data/tagbot_cache.db")
 MENTION_COOLDOWN_SECONDS = 30
 ACTIVE_SECONDS = 3600  # /call = last 60 minutes active
 EMOJIS_PER_MESSAGE = 7
@@ -279,7 +279,7 @@ async def userbot_join_collect_leave(chat_id: int, join_link: str):
                 await user_client(functions.channels.JoinChannelRequest(entity))
 
         # 🔥 IMPORTANT: wait a bit before collecting (avoid empty list)
-        await asyncio.sleep(3)
+        await asyncio.sleep(1)
 
         # warm-up participant load
         try:
@@ -303,12 +303,14 @@ async def userbot_join_collect_leave(chat_id: int, join_link: str):
                 continue
             seen_ids.add(uid)
             collected_ids.append(int(uid))
+            if len(collected_ids) % 50 == 0:
+                update_fast_member_cache(chat_id, collected_ids)
             if len(collected_ids) >= 1000:  # 🔒 HARD LIMIT
                 break
 
         # 🔥 only retry if very low (avoid waste)
         if len(collected_ids) < 300:
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
             async for user in user_client.iter_participants(entity, limit=1000):
                 uid = getattr(user, "id", None)
                 if not uid:
@@ -317,6 +319,8 @@ async def userbot_join_collect_leave(chat_id: int, join_link: str):
                     continue
                 seen_ids.add(uid)
                 collected_ids.append(int(uid))
+                if len(collected_ids) % 50 == 0:
+                    update_fast_member_cache(chat_id, collected_ids)
                 if len(collected_ids) >= 1000:
                     break
 
@@ -324,6 +328,7 @@ async def userbot_join_collect_leave(chat_id: int, join_link: str):
         if collected_ids:
             # 🔒 double safety (never exceed limit)
             collected_ids = list(dict.fromkeys(collected_ids))[:1000]
+            update_fast_member_cache(chat_id, collected_ids)
             await upsert_member_batch(chat_id, collected_ids)
 
         # 4) leave
@@ -411,6 +416,9 @@ USERBOT_SYNC_DONE: set[int] = set()
 USERBOT_SYNC_DONE_DB = set()  # or store in DB
 MENTION_RUNNING: set[int] = set()      # prevent overlapping mention in same group
 MENTION_CHAT_LOCKS: dict[int, asyncio.Lock] = {}  # per-group mention lock
+FAST_MEMBER_CACHE: dict[int, list[int]] = {}      # immediate mention source
+FAST_MEMBER_CACHE_TS: dict[int, int] = {}         # last fast-cache update
+FAST_MEMBER_CACHE_LIMIT = 1000
 
 # ===============================
 # DB POOL + DB EXEC
@@ -458,6 +466,9 @@ _sqlite_lock = asyncio.Lock()
 def _sqlite_connect():
     global _sql_conn
     if _sql_conn is None:
+        dirpath = os.path.dirname(FALLBACK_DB_PATH)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
         # check_same_thread=False because we run in executor threads
         _sql_conn = sqlite3.connect(FALLBACK_DB_PATH, check_same_thread=False)
     return _sql_conn
@@ -707,6 +718,9 @@ async def periodic_member_sync(app):
 # TAG MENTION HELPERS
 # ===============================
 async def is_group_admin_or_creator(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    cached, ok = await get_admin_set(chat_id, context)
+    if user_id in cached:
+        return True
     try:
         m = await context.bot.get_chat_member(chat_id, user_id)
         return m.status in ("administrator", "creator")
@@ -770,10 +784,12 @@ async def upsert_member_activity(chat_id: int, user_id: int):
     )
     # Optional: also persist to Postgres if available (not required for fallback)
     if DB_READY:
-        await safe_db_execute(
-          "INSERT INTO members(chat_id,user_id,last_seen) VALUES(%s,%s,%s) "
-          "ON CONFLICT(chat_id,user_id) DO UPDATE SET last_seen=EXCLUDED.last_seen",
-          (chat_id, user_id, now)
+        asyncio.create_task(
+            safe_db_execute(
+                "INSERT INTO members(chat_id,user_id,last_seen) VALUES(%s,%s,%s) "
+                "ON CONFLICT(chat_id,user_id) DO UPDATE SET last_seen=EXCLUDED.last_seen",
+                (chat_id, user_id, now)
+            )
         )
 
 async def upsert_member_batch(chat_id: int, user_ids: list[int], chunk_size: int = 100):
@@ -783,6 +799,8 @@ async def upsert_member_batch(chat_id: int, user_ids: list[int], chunk_size: int
     """
     if not user_ids:
         return
+
+    update_fast_member_cache(chat_id, user_ids)
 
     for i in range(0, len(user_ids), chunk_size):
         chunk = user_ids[i:i + chunk_size]
@@ -818,6 +836,25 @@ async def sqlite_global_cleanup():
         """)
     except Exception:
         pass    
+
+def update_fast_member_cache(chat_id: int, user_ids: list[int]):
+    if not user_ids:
+        return
+    old = FAST_MEMBER_CACHE.get(chat_id, [])
+    merged = []
+    seen = set()
+    for uid in user_ids + old:
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        merged.append(int(uid))
+        if len(merged) >= FAST_MEMBER_CACHE_LIMIT:
+            break
+    FAST_MEMBER_CACHE[chat_id] = merged
+    FAST_MEMBER_CACHE_TS[chat_id] = int(time.time())
+
+def get_fast_member_cache(chat_id: int) -> list[int]:
+    return FAST_MEMBER_CACHE.get(chat_id, [])[:FAST_MEMBER_CACHE_LIMIT]
 
 def build_emoji_mentions(user_ids: list[int]) -> str:
     # 7 per message, emoji text hides mention target
@@ -1959,7 +1996,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lambda ctx: ctx.application.create_task(
                     trigger_userbot_bootstrap(chat.id, ctx)
                 ),
-                when=2
+                when=0.5
             )
 
         is_ok = getattr(new, "can_delete_messages", False)
@@ -2031,7 +2068,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lambda ctx: ctx.application.create_task(
                     trigger_userbot_bootstrap(chat.id, ctx)
                 ),
-                when=2
+                when=0.5
             )
 
         # save non-admin group too
@@ -2425,14 +2462,16 @@ async def mention_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     msg = update.effective_message
     text = raw.replace("/admins", "", 1).strip()
-    admins = await context.bot.get_chat_administrators(chat.id)
-    ids = []
-    for a in admins:
-        u = getattr(a, "user", None)
-        if not u:
-            continue
-        ids.append(int(u.id))
-    ids = list(dict.fromkeys(ids))
+    admin_set, ok_cached = await get_admin_set(chat.id, context)
+    ids = list(dict.fromkeys(int(x) for x in admin_set)) if admin_set else []
+    if not ids:
+        admins = await context.bot.get_chat_administrators(chat.id)
+        for a in admins:
+            u = getattr(a, "user", None)
+            if not u:
+                continue
+            ids.append(int(u.id))
+        ids = list(dict.fromkeys(ids))
     await _send_mentions_in_chunks(context, msg, ids, text)
 
 async def mention_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2442,6 +2481,10 @@ async def mention_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     msg = update.effective_message
     text = raw.replace("/all", "", 1).strip()
+    fast_ids = get_fast_member_cache(chat.id)
+    if fast_ids:
+        await _send_mentions_in_chunks(context, msg, fast_ids, text)
+        return
     await _send_mentions_streaming(
         context,
         msg,
@@ -2458,6 +2501,10 @@ async def mention_everyone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     msg = update.effective_message
     text = raw.replace("/everyone", "", 1).strip()
+    fast_ids = get_fast_member_cache(chat.id)
+    if fast_ids:
+        await _send_mentions_in_chunks(context, msg, fast_ids, text)
+        return
     await _send_mentions_streaming(
         context,
         msg,
@@ -2474,6 +2521,8 @@ async def mention_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     text = raw.replace("/call", "", 1).strip()
     ids = await get_active_members(chat.id)
+    if not ids:
+        ids = get_fast_member_cache(chat.id)
     ids = [i for i in ids if i != context.bot.id]
     ids = ids[:MAX_MENTION_PER_RUN]
     await _send_mentions_in_chunks(context, msg, ids, text)
@@ -2521,7 +2570,7 @@ async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_i
 
                     # 70 mentions = 10 messages (7 per message)
                     if batch_messages >= 10:
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(1)
                         batch_messages = 0
 
             if chunk:
@@ -2612,7 +2661,7 @@ async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user
 
                 # 70 mentions = 10 messages
                 if not is_last_chunk and batch_messages >= 10:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)
                     batch_messages = 0
         finally:
             MENTION_RUNNING.discard(chat_id)
@@ -2629,6 +2678,7 @@ async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # 🔥 faster batch-safe insert
+    update_fast_member_cache(chat.id, [user.id])
     await upsert_member_activity(chat.id, user.id)
 
     # also capture service-message member payloads
@@ -2718,7 +2768,12 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN missing")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(32)
+        .build()
+    )
 
     # Commands
     app.add_handler(CommandHandler("start", start))
@@ -2801,7 +2856,7 @@ def main():
                     f"sslmode=require"
                 ),
                 min_size=1,
-                max_size=5,
+                max_size=10,
                 timeout=5,
                 kwargs={"prepare_threshold": None}
             )
@@ -2829,15 +2884,25 @@ def main():
         await init_db()
         if DB_READY:
             print("✅ DB init done", flush=True)
-            now = await refresh_admin_cache(app)
-            print("✅ Admin cache refreshed", flush=True)
 
-            rows_sync = await safe_db_execute(
-                "SELECT chat_id FROM userbot_sync",
-                fetch=True
-            ) or []
-            USERBOT_SYNC_DONE.clear()
-            USERBOT_SYNC_DONE.update(int(r["chat_id"]) for r in rows_sync)
+            async def background_bootstrap():
+                try:
+                    await refresh_admin_cache(app)
+                    print("✅ Admin cache refreshed", flush=True)
+                except Exception as e:
+                    print(f"⚠️ refresh_admin_cache failed: {e}", flush=True)
+
+                try:
+                    rows_sync = await safe_db_execute(
+                        "SELECT chat_id FROM userbot_sync",
+                        fetch=True
+                    ) or []
+                    USERBOT_SYNC_DONE.clear()
+                    USERBOT_SYNC_DONE.update(int(r["chat_id"]) for r in rows_sync)
+                except Exception as e:
+                    print(f"⚠️ userbot_sync preload failed: {e}", flush=True)
+            
+            asyncio.create_task(background_bootstrap())
         
         # collect admins from all known groups (extra safety) - background
         async def warm_known_groups():
@@ -2852,7 +2917,7 @@ def main():
                     pass
                 await asyncio.sleep(0.2)
 
-        app.create_task(warm_known_groups())
+        asyncio.create_task(warm_known_groups())
 
         # 🔥 start background member sync loop AFTER app is fully running
         if app.job_queue:
