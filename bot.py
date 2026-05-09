@@ -32,13 +32,15 @@ from telegram.ext import (
 
 from psycopg_pool import ConnectionPool  # ✅ ONLY THIS (Supabase safe)
 
-# Optional Telethon userbot
+# MTProto Bot Mode (Telethon — Bot Token နဲ့)
 try:
     from telethon import TelegramClient, functions, types
+    from telethon.errors import FloodWaitError, ChatAdminRequiredError, ChannelPrivateError
     from telethon.sessions import StringSession
     TELETHON_AVAILABLE = True
 except Exception:
     TELETHON_AVAILABLE = False
+    FloodWaitError = Exception
 
 # ===============================
 # CONFIG / CONSTANTS
@@ -55,7 +57,6 @@ DB_PORT = int(os.getenv("SUPABASE_PORT", "6543"))
 
 TG_API_ID = int(os.getenv("TG_API_ID", "0"))
 TG_API_HASH = os.getenv("TG_API_HASH", "")
-TG_SESSION = os.getenv("TG_SESSION", "")
 
 # Admin-list cache (performance: avoid per-user get_chat_member too often)
 ADMIN_LIST_CACHE: dict[int, set[int]] = {}
@@ -72,6 +73,11 @@ FALLBACK_DB_PATH = os.getenv("FALLBACK_DB_PATH", "/app/data/tagbot_cache.db")
 MENTION_COOLDOWN_SECONDS = 30
 ACTIVE_SECONDS = 3600  # /call = last 60 minutes active
 EMOJIS_PER_MESSAGE = 7
+
+# Rate Limit Protection
+SEND_DELAY_SECONDS = 1.2       # Message တစ်ခုနဲ့တစ်ခု ကြားအချိန်
+SEND_BATCH_SIZE = 10           # Message 10 ခုပြီးတိုင်း delay
+SEND_BATCH_DELAY = 2.0         # Batch 10 ကုန်ရင် 2 စက္ကန့် နားမယ်
 
 # as big as you want (add more anytime)
 EMOJI_POOL = [
@@ -100,7 +106,7 @@ async def maybe_collect_message_members(msg):
 
     left_member = getattr(msg, "left_chat_member", None)
     if left_member:
-        await upsert_member_activity(chat.id, left_member.id)
+        await remove_member_activity(chat.id, left_member.id)
 
 async def maybe_collect_related_users(msg):
     """
@@ -137,15 +143,12 @@ async def maybe_collect_related_users(msg):
         for u in (getattr(reply, "new_chat_members", None) or []):
             await add_user(u)
 
-        await add_user(getattr(reply, "left_chat_member", None))
-
         # pinned message inside reply
         pinned2 = getattr(reply, "pinned_message", None)
         if pinned2:
             await add_user(getattr(pinned2, "from_user", None))
             for u in (getattr(pinned2, "new_chat_members", None) or []):
                 await add_user(u)
-            await add_user(getattr(pinned2, "left_chat_member", None))
 
     # pinned message on current message
     pinned = getattr(msg, "pinned_message", None)
@@ -153,7 +156,6 @@ async def maybe_collect_related_users(msg):
         await add_user(getattr(pinned, "from_user", None))
         for u in (getattr(pinned, "new_chat_members", None) or []):
             await add_user(u)
-        await add_user(getattr(pinned, "left_chat_member", None))
 
     # text mentions in message entities
     for ent in (getattr(msg, "entities", None) or []):
@@ -253,138 +255,111 @@ async def get_join_link_for_userbot(chat_id: int, context: ContextTypes.DEFAULT_
 
     return None
 
-async def userbot_join_collect_leave(chat_id: int, join_link: str):
+async def mtproto_get_participants(chat_id: int) -> list[int]:
     """
-    Userbot joins -> collects members -> leaves.
-    Best effort only.
+    MTProto Bot mode နဲ့ member list ဆွဲတယ်။
+    Userbot မလို — Bot Token တစ်ခုပဲ လိုတယ်။
+    Rate limit ကာကွယ်ဖို့ cache + cooldown ထည့်ထားတယ်။
     """
     global user_client
+    if not TELETHON_AVAILABLE or user_client is None:
+        return []
 
-    if not TELETHON_AVAILABLE or user_client is None or not join_link:
-        return
+    # ── Per-group lock (တစ်ချိန်တည်း နှစ်ကြိမ် fetch မဖြစ်အောင်) ──
+    lock = PARTICIPANTS_FETCH_LOCK.setdefault(chat_id, asyncio.Lock())
+    if lock.locked():
+        # တခြား coroutine fetch နေရင် cache ပြန်ပေး
+        return PARTICIPANTS_CACHE.get(chat_id, [])
 
-    collected_ids = []
-    seen_ids = set()
+    async with lock:
+        now = int(time.time())
 
-    try:
-        # 1) join
-        if "joinchat/" in join_link or "/+" in join_link:
-            invite_hash = join_link.rsplit("/", 1)[-1].replace("+", "")
-            await user_client(functions.messages.ImportChatInviteRequest(invite_hash))
-            entity = await user_client.get_entity(join_link)
-        else:
-            username = join_link.rstrip("/").rsplit("/", 1)[-1].lstrip("@")
-            entity = await user_client.get_entity(username)
-            if isinstance(entity, types.Channel):
-                await user_client(functions.channels.JoinChannelRequest(entity))
+        # ── Cache စစ်ဆေး (1 နာရီ မကုန်သေးရင် cache သုံး) ──
+        cached_ts = PARTICIPANTS_CACHE_TS.get(chat_id, 0)
+        if now - cached_ts < PARTICIPANTS_CACHE_TTL:
+            cached = PARTICIPANTS_CACHE.get(chat_id)
+            if cached:
+                return cached
 
-        # 🔥 IMPORTANT: wait a bit before collecting (avoid empty list)
-        await asyncio.sleep(1)
+        # ── Cooldown စစ်ဆေး (5 min အတွင်း API မခေါ်ရ) ──
+        last_fetch = PARTICIPANTS_LAST_FETCH.get(chat_id, 0)
+        if now - last_fetch < PARTICIPANTS_FETCH_COOLDOWN:
+            return PARTICIPANTS_CACHE.get(chat_id, [])
 
-        # warm-up participant load
+        PARTICIPANTS_LAST_FETCH[chat_id] = now
+
+        collected = []
         try:
-            async for _ in user_client.iter_participants(entity, limit=50):
-                break
-        except Exception:
-            pass
-
-        # 2) collect members
-        async for user in user_client.iter_participants(
-            entity,
-            limit=1000,
-            aggressive=True
-        ):
-            if getattr(user, "bot", False):
-                continue
-            uid = getattr(user, "id", None)
-            if not uid:
-                continue
-            if uid in seen_ids:
-                continue
-            seen_ids.add(uid)
-            collected_ids.append(int(uid))
-            if len(collected_ids) % 50 == 0:
-                update_fast_member_cache(chat_id, collected_ids)
-            if len(collected_ids) >= 1000:  # 🔒 HARD LIMIT
-                break
-
-        # 🔥 only retry if very low (avoid waste)
-        if len(collected_ids) < 300:
-            await asyncio.sleep(1)
-            async for user in user_client.iter_participants(entity, limit=1000):
+            async for user in user_client.iter_participants(chat_id, limit=MAX_MEMBER_STORE):
+                if getattr(user, "bot", False):
+                    continue
                 uid = getattr(user, "id", None)
-                if not uid:
-                    continue
-                if uid in seen_ids:
-                    continue
-                seen_ids.add(uid)
-                collected_ids.append(int(uid))
-                if len(collected_ids) % 50 == 0:
-                    update_fast_member_cache(chat_id, collected_ids)
-                if len(collected_ids) >= 1000:
+                if uid:
+                    collected.append(int(uid))
+                if len(collected) >= MAX_MEMBER_STORE:
                     break
 
-        # 3) save
-        if collected_ids:
-            # 🔒 double safety (never exceed limit)
-            collected_ids = list(dict.fromkeys(collected_ids))[:1000]
-            update_fast_member_cache(chat_id, collected_ids)
-            await upsert_member_batch(chat_id, collected_ids)
+            # ── Cache သိမ်း ──
+            PARTICIPANTS_CACHE[chat_id] = collected
+            PARTICIPANTS_CACHE_TS[chat_id] = int(time.time())
+            return collected
 
-        # 4) leave
-        try:
-            if isinstance(entity, types.Channel):
-                await user_client(functions.channels.LeaveChannelRequest(entity))
-            elif isinstance(entity, types.Chat):
-                me = await user_client.get_me()
-                await user_client(functions.messages.DeleteChatUserRequest(
-                    chat_id=entity.id,
-                    user_id=me.id
-                ))
-        except Exception:
-            pass
+        except FloodWaitError as e:
+            wait = getattr(e, "seconds", 30)
+            rate_limited_log(
+                f"flood_{chat_id}",
+                f"⚠️ FloodWait {wait}s for chat {chat_id} — cache သုံးပါမယ်"
+            )
+            # FloodWait ဖြစ်ရင် cache ကို fallback သုံး (bot မရပ်နဲ့)
+            return PARTICIPANTS_CACHE.get(chat_id, [])
 
-    except Exception as e:
-        rate_limited_log("userbot_join_collect_leave", f"⚠️ userbot sync failed for {chat_id}: {e}")
+        except (ChatAdminRequiredError, ChannelPrivateError):
+            # Bot ကို participant list ကြည့်ခွင့် မရှိဘူး
+            rate_limited_log(f"noperm_{chat_id}", f"⚠️ No permission to get participants: {chat_id}")
+            return PARTICIPANTS_CACHE.get(chat_id, [])
 
-async def trigger_userbot_bootstrap(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+        except Exception as e:
+            rate_limited_log(f"fetch_err_{chat_id}", f"⚠️ mtproto_get_participants error: {e}")
+            return PARTICIPANTS_CACHE.get(chat_id, [])
+
+async def trigger_mtproto_bootstrap(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     """
-    Best-effort bootstrap:
-    - get public/invite link
-    - userbot join
-    - collect members
-    - leave
+    Bot ကို group ထည့်တာနဲ့ ချက်ချင်း MTProto နဲ့ member list ဆွဲတယ်။
+    Userbot မလို — Bot Token တစ်ခုပဲ လိုတယ်။
     """
-    
-    # ❗ already synced → don't run again
     if chat_id in USERBOT_SYNC_DONE:
         return
-    
+
     try:
-        link = await get_join_link_for_userbot(chat_id, context)
+        # Step 1: Admin list ကို Bot API နဲ့ ချက်ချင်းဆွဲ (fast)
+        await collect_admins(chat_id, context)
+        await fast_warmup_collect(chat_id, context)
 
-        # ❗ PRIVATE GROUP → NO LINK → fallback to bot-only collect
-        if not link:
-            try:
-                # 🔥 better fallback: collect admins + warmup + activity
-                await collect_admins(chat_id, context)
-                await fast_warmup_collect(chat_id, context)
-                await sync_members_silent(chat_id)
-            except Exception:
-                pass
-            return
+        # Step 2: MTProto နဲ့ full member list ဆွဲ
+        ids = await mtproto_get_participants(chat_id)
 
-        # ✅ PUBLIC GROUP ONLY
-        await userbot_join_collect_leave(chat_id, link)
-    
-        # mark done
+        if ids:
+            await upsert_member_batch(chat_id, ids)
+            rate_limited_log(
+                f"bootstrap_{chat_id}",
+                f"✅ MTProto bootstrap done: {len(ids)} members for {chat_id}"
+            )
+
+        # Mark done
         USERBOT_SYNC_DONE.add(chat_id)
         await safe_db_execute(
             "INSERT INTO userbot_sync(chat_id) VALUES (%s) ON CONFLICT DO NOTHING",
             (chat_id,)
         )
-    except Exception:
-        pass
+
+    except Exception as e:
+        rate_limited_log(f"bootstrap_err_{chat_id}", f"⚠️ MTProto bootstrap error: {e}")
+        # Fallback: passive collection သာ
+        try:
+            await collect_admins(chat_id, context)
+            await fast_warmup_collect(chat_id, context)
+        except Exception:
+            pass
 
 # ===============================
 # GLOBAL CACHES / STATE
@@ -401,6 +376,14 @@ PENDING_BUTTON_WAIT = {}
 BOT_START_TIME = int(time.time())
 
 user_client = None
+
+# MTProto participants cache (rate limit ကာကွယ်ရန်)
+PARTICIPANTS_CACHE: dict[int, list[int]] = {}
+PARTICIPANTS_CACHE_TS: dict[int, int] = {}
+PARTICIPANTS_CACHE_TTL = 3600        # 1 နာရီ cache သိမ်း
+PARTICIPANTS_FETCH_LOCK: dict[int, asyncio.Lock] = {}
+PARTICIPANTS_LAST_FETCH: dict[int, int] = {}
+PARTICIPANTS_FETCH_COOLDOWN = 300    # 5 min တစ်ကြိမ်သာ API ခေါ်မယ်
 
 LOG_RATE_CACHE = {}
 LOG_RATE_SECONDS = 60
@@ -650,13 +633,13 @@ def clear_reminders(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         if name.startswith("auto_leave_") or data.get("type") == "admin_reminder":
             job.schedule_removal()
 
-# pagination helper (OFFSET version) - from your pasted code
-async def iter_db_ids(query, batch_size=500):
-    offset = 0
+# pagination helper (keyset version)
+async def iter_db_ids(table, id_column, batch_size=500):
+    last_id = -(2**63)
     while True:
         rows = await safe_db_execute(
-            f"{query} LIMIT %s OFFSET %s",
-            (batch_size, offset),
+            f"SELECT {id_column} FROM {table} WHERE {id_column} > %s ORDER BY {id_column} LIMIT %s",
+            (last_id, batch_size),
             fetch=True
         )
         if rows is None:
@@ -664,7 +647,7 @@ async def iter_db_ids(query, batch_size=500):
         if not rows:
             break
         yield rows
-        offset += batch_size
+        last_id = int(rows[-1][id_column])
 
 async def update_progress(msg, done, total):
     if total <= 0:
@@ -792,6 +775,25 @@ async def upsert_member_activity(chat_id: int, user_id: int):
             )
         )
 
+async def remove_member_activity(chat_id: int, user_id: int):
+    cache = FAST_MEMBER_CACHE.get(chat_id, [])
+    if cache:
+        FAST_MEMBER_CACHE[chat_id] = [uid for uid in cache if uid != user_id][:FAST_MEMBER_CACHE_LIMIT]
+        FAST_MEMBER_CACHE_TS[chat_id] = int(time.time())
+
+    await sqlite_execute(
+        "DELETE FROM members WHERE chat_id=? AND user_id=?",
+        (chat_id, user_id)
+    )
+
+    if DB_READY:
+        asyncio.create_task(
+            safe_db_execute(
+                "DELETE FROM members WHERE chat_id=%s AND user_id=%s",
+                (chat_id, user_id)
+            )
+        )
+
 async def upsert_member_batch(chat_id: int, user_ids: list[int], chunk_size: int = 100):
     """
     Safer than gathering 500 writes at once.
@@ -856,6 +858,9 @@ def update_fast_member_cache(chat_id: int, user_ids: list[int]):
 def get_fast_member_cache(chat_id: int) -> list[int]:
     return FAST_MEMBER_CACHE.get(chat_id, [])[:FAST_MEMBER_CACHE_LIMIT]
 
+def is_mention_stopped(chat_id: int) -> bool:
+    return chat_id in STOPPED_CHATS
+
 def build_emoji_mentions(user_ids: list[int]) -> str:
     # 7 per message, emoji text hides mention target
     mentions = []
@@ -884,46 +889,14 @@ async def get_all_members(chat_id: int) -> list[int]:
 
 async def iter_all_members(chat_id: int, batch_size: int = 700):
     """
-    Stream members from DB/SQLite without loading the whole list into RAM.
-    700 = 100 mention messages worth (7 per message).
+    Stable snapshot iterator.
+    Uses get_all_members() first so DB failure can fall back to SQLite cleanly,
+    and mention order won't shift mid-run from OFFSET paging.
     """
-    if DB_READY:
-        offset = 0
-        while True:
-            rows = await safe_db_execute(
-                "SELECT user_id FROM members WHERE chat_id=%s "
-                "ORDER BY last_seen DESC LIMIT %s OFFSET %s",
-                (chat_id, min(batch_size, MAX_MEMBER_STORE), offset),
-                fetch=True
-            )
-            if not rows:
-                break
-            for r in rows:
-                uid = int(r["user_id"])
-                if uid != 0:
-                    yield uid
-            offset += batch_size
-            if offset >= MAX_MEMBER_STORE:
-                break
-        return
-
-    offset = 0
-    while True:
-        rows = await sqlite_execute(
-            "SELECT user_id FROM members WHERE chat_id=? "
-            "ORDER BY last_seen DESC LIMIT ? OFFSET ?",
-            (chat_id, min(batch_size, MAX_MEMBER_STORE), offset),
-            fetch=True
-        ) or []
-        if not rows:
-            break
-        for r in rows:
-            uid = int(r[0])
-            if uid != 0:
-                yield uid
-        offset += batch_size
-        if offset >= MAX_MEMBER_STORE:
-            break
+    ids = await get_all_members(chat_id)
+    for uid in ids[:MAX_MEMBER_STORE]:
+        if uid != 0:
+            yield uid
 
 async def get_active_members(chat_id: int) -> list[int]:
     now = int(time.time())
@@ -1663,12 +1636,12 @@ async def run_broadcast(context: ContextTypes.DEFAULT_TYPE,data: dict,target_typ
             await update_progress(progress_msg, attempted, total)
 
     if target_type in ("bc_target_users", "bc_target_all"):
-        async for rows in iter_db_ids("SELECT user_id FROM users ORDER BY user_id"):
+        async for rows in iter_db_ids("users", "user_id"):
             for r in rows:
                 await send_with_optional_button(int(r["user_id"]), is_group=False)
 
     if target_type in ("bc_target_groups", "bc_target_all"):
-        async for rows in iter_db_ids("SELECT group_id FROM groups ORDER BY group_id"):
+        async for rows in iter_db_ids("groups", "group_id"):
             for r in rows:
                 await send_with_optional_button(int(r["group_id"]), is_group=True)
 
@@ -1994,9 +1967,9 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat.id not in USERBOT_SYNC_DONE and context.job_queue:
             context.job_queue.run_once(
                 lambda ctx: ctx.application.create_task(
-                    trigger_userbot_bootstrap(chat.id, ctx)
+                    trigger_mtproto_bootstrap(chat.id, ctx)   # ← ဒါပဲ ပြောင်း
                 ),
-                when=0.5
+                when=1.0
             )
 
         is_ok = getattr(new, "can_delete_messages", False)
@@ -2049,6 +2022,17 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if old.user.id == bot_id and old.status in ("administrator", "creator") and new.status in ("member", "left", "kicked"):
         BOT_ADMIN_CACHE.discard(chat.id)
         clear_reminders(context, chat.id)
+        context.application.create_task(
+            safe_db_execute(
+                """
+                UPDATE groups
+                SET is_admin_cached = FALSE,
+                    last_checked_at = %s
+                WHERE group_id = %s
+                """,
+                (int(time.time()), chat.id)
+            )
+        )
         return
 
     # ✅ BOT ADDED AS MEMBER (NOT ADMIN)
@@ -2066,7 +2050,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat.id not in USERBOT_SYNC_DONE and context.job_queue:
             context.job_queue.run_once(
                 lambda ctx: ctx.application.create_task(
-                    trigger_userbot_bootstrap(chat.id, ctx)
+                    trigger_mtproto_bootstrap(chat.id, ctx)
                 ),
                 when=0.5
             )
@@ -2188,6 +2172,7 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_ADMIN_CACHE.pop(chat_id, None)
     ADMIN_LIST_CACHE.pop(chat_id, None)
     ADMIN_LIST_CACHE_TS.pop(chat_id, None)
+    ADMIN_VERIFY_CACHE.pop(chat_id, None)
 
     try:
         me = await context.bot.get_chat_member(chat_id, context.bot.id)
@@ -2328,8 +2313,28 @@ async def refresh_admin_cache(app):
                         (now, new_id)
                     )
             except Exception as e2:
+                skipped += 1
+                await safe_db_execute(
+                    """
+                    UPDATE groups
+                    SET is_admin_cached = FALSE,
+                        last_checked_at = %s
+                    WHERE group_id = %s
+                    """,
+                    (now, new_id)
+                )
                 print(f"⚠️ Skip migrated admin check for {new_id}: {e2}", flush=True)
         except Exception as e:
+            skipped += 1
+            await safe_db_execute(
+                """
+                UPDATE groups
+                SET is_admin_cached = FALSE,
+                    last_checked_at = %s
+                WHERE group_id = %s
+                """,
+                (now, gid)
+            )
             print(f"⚠️ Skip admin check for {gid}: {e}", flush=True)
 
         await asyncio.sleep(0.3)
@@ -2540,6 +2545,9 @@ async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_i
             batch_messages = 0
 
             async for uid in id_iter:
+                if is_mention_stopped(chat_id):
+                    return
+
                 if uid == context.bot.id:
                     continue
                 if picked >= limit:
@@ -2549,6 +2557,9 @@ async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_i
                 picked += 1
 
                 if len(chunk) == EMOJIS_PER_MESSAGE:
+                    if is_mention_stopped(chat_id):
+                        return
+
                     line = build_emoji_mentions(chunk)
                     body = f"{escape(text)}\n\n{line}" if text else line
                     try:
@@ -2568,10 +2579,19 @@ async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_i
                     batch_messages += 1
                     chunk = []
 
-                    # 70 mentions = 10 messages (7 per message)
-                    if batch_messages >= 10:
-                        await asyncio.sleep(1)
+                    # ── Rate limit protection ──
+                    await asyncio.sleep(SEND_DELAY_SECONDS)
+                    if batch_messages >= SEND_BATCH_SIZE:
+                        await asyncio.sleep(SEND_BATCH_DELAY)
                         batch_messages = 0
+
+                    # ── Stop check (user ကို /stop ခေါ်ပေးဖို့) ──
+                    if chat_id in STOPPED_CHATS:
+                        break
+
+            if is_mention_stopped(chat_id):
+                return
+
 
             if chunk:
                 line = build_emoji_mentions(chunk)
@@ -2584,6 +2604,7 @@ async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_i
                         parse_mode="HTML",
                         reply_to_message_id=None
                     )
+                    await asyncio.sleep(SEND_DELAY_SECONDS)
                 except Exception:
                     fallback_body = ((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
                     fallback_body += "\n\nခေါ်ဆိုမှု့ပြီးဆုံးပါပြီး။\n@MMTelegramBotss"
@@ -2607,8 +2628,9 @@ async def _send_mentions_streaming(context: ContextTypes.DEFAULT_TYPE, msg, id_i
                 )
         finally:
             MENTION_RUNNING.discard(chat_id)
-            if chat_id not in MENTION_RUNNING and not lock.locked():
-                MENTION_CHAT_LOCKS.pop(chat_id, None)
+
+    if chat_id not in MENTION_RUNNING and not lock.locked() and MENTION_CHAT_LOCKS.get(chat_id) is lock:
+        MENTION_CHAT_LOCKS.pop(chat_id, None)
 
 async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user_ids: list[int], text: str):
     chat_id = msg.chat_id
@@ -2629,6 +2651,14 @@ async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user
             batch_messages = 0
 
             for i in range(0, len(user_ids), EMOJIS_PER_MESSAGE):
+
+                # ── Stop check ──
+                if chat_id in STOPPED_CHATS:
+                    break                
+                
+                if is_mention_stopped(chat_id):
+                    return
+
                 chunk = user_ids[i:i+EMOJIS_PER_MESSAGE]
                 line = build_emoji_mentions(chunk)
                 is_last_chunk = (i + EMOJIS_PER_MESSAGE) >= len(user_ids)
@@ -2648,6 +2678,16 @@ async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user
                         parse_mode="HTML",
                         reply_to_message_id=None
                     )
+                except RetryAfter as e:
+                    # ── RetryAfter တိတိကျကျ handle ──
+                    rate_limited_log(f"retry_{chat_id}", f"⚠️ RetryAfter {e.retry_after}s")
+                    await asyncio.sleep(e.retry_after + 1)
+                    try:
+                        await context.bot.send_message(
+                            chat_id=chat_id, text=body, parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass                
                 except Exception:
                     fallback_body = ((text + "\n\n" if text else "") + " ".join(["🙂"] * len(chunk)))
                     if is_last_chunk:
@@ -2659,14 +2699,17 @@ async def _send_mentions_in_chunks(context: ContextTypes.DEFAULT_TYPE, msg, user
 
                 batch_messages += 1
 
-                # 70 mentions = 10 messages
-                if not is_last_chunk and batch_messages >= 10:
-                    await asyncio.sleep(1)
-                    batch_messages = 0
+                # ── Rate limit protection ──
+                if not is_last_chunk:
+                    await asyncio.sleep(SEND_DELAY_SECONDS)
+                    if batch_messages >= SEND_BATCH_SIZE:
+                        await asyncio.sleep(SEND_BATCH_DELAY)
+                        batch_messages = 0
         finally:
             MENTION_RUNNING.discard(chat_id)
-            if chat_id not in MENTION_RUNNING and not lock.locked():
-                MENTION_CHAT_LOCKS.pop(chat_id, None)
+
+    if chat_id not in MENTION_RUNNING and not lock.locked() and MENTION_CHAT_LOCKS.get(chat_id) is lock:
+        MENTION_CHAT_LOCKS.pop(chat_id, None)
 
 async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -2704,10 +2747,8 @@ async def track_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not chat or not user:
         return
 
-    try:
-        await upsert_member_activity(chat.id, user.id)
-    except Exception:
-        pass
+    # Join request sender is NOT a member yet.
+    return
 
 async def track_callback_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2760,6 +2801,9 @@ async def track_member_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await sync_members_silent(chat.id)
         except Exception:
             pass
+    elif old_status in ("member", "administrator", "creator", "restricted") and new_status in ("left", "kicked"):
+        await remove_member_activity(chat.id, user.id)
+
 # ===============================
 # MAIN
 # ===============================
@@ -2794,7 +2838,6 @@ def main():
     
     # Join event tracking
     app.add_handler(ChatMemberHandler(track_member_join, ChatMemberHandler.CHAT_MEMBER))
-    app.add_handler(ChatJoinRequestHandler(track_join_request))
 
     # Track callback users in groups
     app.add_handler(CallbackQueryHandler(track_callback_user), group=2)
@@ -2868,17 +2911,21 @@ def main():
             pool = None
             DB_READY = False
 
-        # Optional Telethon userbot
-        if TELETHON_AVAILABLE and TG_API_ID and TG_API_HASH and TG_SESSION:
+        # MTProto Bot Mode (Bot Token နဲ့ — phone number မလို)
+        if TELETHON_AVAILABLE and TG_API_ID and TG_API_HASH and BOT_TOKEN:
             try:
-                user_client = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
-                await user_client.start()
-                print("✅ Userbot connected", flush=True)
+                user_client = TelegramClient(
+                    StringSession(),   # ← Session file မလို
+                    TG_API_ID,
+                    TG_API_HASH
+                )
+                await user_client.start(bot_token=BOT_TOKEN)  # ← Bot token သာ သုံး
+                print("✅ MTProto Bot mode connected", flush=True)
             except Exception as e:
                 user_client = None
-                print(f"⚠️ Userbot startup failed: {e}", flush=True)
+                print(f"⚠️ MTProto startup failed: {e}", flush=True)
         else:
-            print("⚠️ Userbot disabled (missing Telethon or env vars)", flush=True)
+            print("⚠️ MTProto disabled (TG_API_ID / TG_API_HASH မရှိ)", flush=True)
         
         # DB is optional now
         await init_db()
@@ -2927,6 +2974,8 @@ def main():
     
     async def on_error(update, context):
         if isinstance(context.error, RetryAfter):
+            # RetryAfter ဖြစ်ရင် log ထားပြီး continue
+            rate_limited_log("global_retry", f"⚠️ Global RetryAfter: {context.error.retry_after}s")
             return
         print("ERROR:", context.error)
 
